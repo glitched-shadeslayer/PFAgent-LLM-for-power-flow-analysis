@@ -36,10 +36,14 @@ from llm.tools import ToolContext, build_default_dispatcher
 from models.schemas import Modification, PowerFlowResult, RemedialAction, SessionState
 from solver.contingency import run_n1_contingency
 from solver.power_flow import SolverConfig
+from solver.power_flow import run_power_flow
 from solver.remedial import apply_remedial_action_inplace, recommend_remedial_actions
 from solver.validators import validate_result
 from viz import make_flow_diagram, make_voltage_heatmap, make_violation_overview
 from viz import make_comparison, make_n1_ranking, make_remedial_ranking
+from viz.comparison import compute_comparison_summary, make_quantitative_comparison
+from viz.benchmark import make_benchmark_figure, compute_benchmark_cards
+from baselines.llm_only import baseline_parsed_from_result, evaluate_against_truth_extended
 from viz.flow_diagram import resolve_flow_positions
 from viz.flow_particles import build_particle_segments, make_flow_particles_html
 from viz.network_plot import build_graph, compute_layout
@@ -112,6 +116,11 @@ ZH = {
     "external_import_btn": "导入并作图",
     "external_import_ok": "已导入外挂 LLM 结果并完成作图。",
     "external_import_err": "导入外挂 LLM 结果失败：{err}",
+    "benchmark_btn": "Benchmark vs 真值",
+    "benchmark_ok": "已完成 LLM vs 真值 Benchmark 对比。",
+    "benchmark_err": "Benchmark 对比失败：{err}",
+    "benchmark_need_llm": "请先导入外挂 LLM 结果。",
+    "benchmark_title": "LLM Benchmark 对比报告",
     "remedial_none": "暂无可应用的缓解建议：请先生成建议。",
 }
 
@@ -177,6 +186,11 @@ EN = {
     "external_import_btn": "Import and Plot",
     "external_import_ok": "Imported external LLM result and rendered plots.",
     "external_import_err": "Failed to import external LLM result: {err}",
+    "benchmark_btn": "Benchmark vs Ground Truth",
+    "benchmark_ok": "LLM vs Ground Truth benchmark completed.",
+    "benchmark_err": "Benchmark failed: {err}",
+    "benchmark_need_llm": "Import an external LLM result first.",
+    "benchmark_title": "LLM Benchmark Report",
     "remedial_none": "No remedial action available to apply. Generate suggestions first.",
 }
 # -----------------------------
@@ -267,9 +281,11 @@ def _init_state() -> None:
         else:
             st.session_state.llm_model = OPENAI_MODEL
     if "llm_last_model_by_provider" not in st.session_state:
+        current_provider = str(st.session_state.get("llm_provider", "gemini"))
+        current_model = str(st.session_state.get("llm_model", GEMINI_MODEL if current_provider == "gemini" else OPENAI_MODEL))
         st.session_state.llm_last_model_by_provider = {
-            "gemini": str(st.session_state.get("llm_model", GEMINI_MODEL) if st.session_state.llm_provider == "gemini" else GEMINI_MODEL),
-            "openai": str(st.session_state.get("llm_model", OPENAI_MODEL) if st.session_state.llm_provider == "openai" else OPENAI_MODEL),
+            "gemini": current_model if current_provider == "gemini" else GEMINI_MODEL,
+            "openai": current_model if current_provider == "openai" else OPENAI_MODEL,
         }
     if "llm_temperature" not in st.session_state:
         if st.session_state.llm_provider == "gemini":
@@ -312,6 +328,15 @@ def _get_theme_base() -> str:
     return "light"
 
 
+def _get_plot_theme() -> str:
+    """Global plot theme controlled by sidebar Color scheme."""
+    scheme = str(st.session_state.get("flow_color_scheme", "light")).strip().lower()
+    if scheme == "dark":
+        return "dark"
+    # "light" and "print" both render on light template.
+    return "light"
+
+
 def _models_for_provider(provider: str) -> list[str]:
     if provider == "gemini":
         return GEMINI_MODELS
@@ -342,7 +367,11 @@ def _list_gemini_models_dynamic(api_key: str) -> tuple[list[str], Optional[str]]
     try:
         from google import genai
     except Exception as e:
-        msg = f"dynamic model list unavailable: {type(e).__name__}: {e}"
+        err_text = str(e)
+        if "API key expired" in err_text or "API_KEY_INVALID" in err_text:
+            msg = "Gemini API key is invalid or expired. Please update API key."
+        else:
+            msg = f"dynamic model list unavailable: {type(e).__name__}"
         cache[key] = {"models": GEMINI_MODELS, "error": msg}
         return GEMINI_MODELS, msg
 
@@ -373,7 +402,13 @@ def _list_gemini_models_dynamic(api_key: str) -> tuple[list[str], Optional[str]]
         cache[key] = {"models": model_list, "error": None}
         return model_list, None
     except Exception as e:
-        msg = f"dynamic model list failed: {type(e).__name__}: {e}"
+        err_text = str(e)
+        if "API key expired" in err_text or "API_KEY_INVALID" in err_text:
+            msg = "Gemini API key is invalid or expired. Please update API key."
+        elif "PERMISSION_DENIED" in err_text:
+            msg = "Gemini API key has no permission to list models."
+        else:
+            msg = f"dynamic model list failed: {type(e).__name__}"
         cache[key] = {"models": GEMINI_MODELS, "error": msg}
         return GEMINI_MODELS, msg
 
@@ -414,7 +449,7 @@ def _sync_tool_context() -> None:
 
     ctx: ToolContext = st.session_state.tool_ctx
     provider, api_key, model = _resolve_llm_settings()
-    ctx.theme = _get_theme_base()
+    ctx.theme = _get_plot_theme()
     ctx.solver_backend = str(st.session_state.get("solver_backend", "pandapower"))
     ctx.llm_provider = provider
     ctx.llm_api_key = api_key
@@ -446,6 +481,19 @@ def _no_api_message(T: Dict[str, str], provider: str) -> str:
 
 def _llm_only_disabled_message() -> str:
     return "This feature is disabled in LLM-only mode due to high token cost and instability. Please switch to PandaPower backend."
+
+
+def _format_llm_runtime_error(err: Exception, T: Dict[str, str]) -> str:
+    s = str(err or "")
+    if "API key expired" in s or "API_KEY_INVALID" in s:
+        return (
+            "Gemini API key is invalid or expired. Please update API key."
+            if T is EN
+            else "Gemini API Key 无效或已过期，请更新后重试。"
+        )
+    if "timeout" in s.lower():
+        return "LLM request timed out." if T is EN else "LLM 请求超时。"
+    return f"LLM request failed: {type(err).__name__}: {err}"
 
 
 def _render_runtime_status_bar(T: Dict[str, str]) -> None:
@@ -510,29 +558,33 @@ def _parse_env_local(path: Path) -> dict[str, str]:
 def _persist_insecure_api_key(provider: str, api_key: str, model: Optional[str] = None) -> None:
     """
     Intentionally insecure: store API key in plain text `.env.local`.
+    Silently skips on read-only filesystems (e.g. Streamlit Cloud).
     """
     env_path = Path(__file__).resolve().parent / ".env.local"
-    env_map = _parse_env_local(env_path)
-    p = str(provider or "").strip().lower()
-    k = str(api_key or "").strip()
-    if p == "gemini":
-        if k:
-            env_map["GEMINI_API_KEY"] = k
-        else:
-            env_map.pop("GEMINI_API_KEY", None)
-        m = str(model or "").strip()
-        if m:
-            env_map["GEMINI_MODEL"] = m
-    elif p == "openai":
-        if k:
-            env_map["OPENAI_API_KEY"] = k
-        else:
-            env_map.pop("OPENAI_API_KEY", None)
-        m = str(model or "").strip()
-        if m:
-            env_map["OPENAI_MODEL"] = m
-    lines = [f"{key}={value}" for key, value in sorted(env_map.items())]
-    env_path.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
+    try:
+        env_map = _parse_env_local(env_path)
+        p = str(provider or "").strip().lower()
+        k = str(api_key or "").strip()
+        if p == "gemini":
+            if k:
+                env_map["GEMINI_API_KEY"] = k
+            else:
+                env_map.pop("GEMINI_API_KEY", None)
+            m = str(model or "").strip()
+            if m:
+                env_map["GEMINI_MODEL"] = m
+        elif p == "openai":
+            if k:
+                env_map["OPENAI_API_KEY"] = k
+            else:
+                env_map.pop("OPENAI_API_KEY", None)
+            m = str(model or "").strip()
+            if m:
+                env_map["OPENAI_MODEL"] = m
+        lines = [f"{key}={value}" for key, value in sorted(env_map.items())]
+        env_path.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
+    except OSError:
+        pass
 
 
 def _extract_json_block(raw_text: str) -> str:
@@ -566,11 +618,66 @@ def _normalize_external_result_payload(payload: Dict[str, Any], raw_text: str) -
 
     totals = payload.get("totals") if isinstance(payload.get("totals"), dict) else {}
     case_name = payload.get("case_name") or st.session_state.session.active_case or "external_case"
+    def _bus_display_id_for_import(net_obj: Any, bus_idx: int) -> int:
+        try:
+            name = str(net_obj.bus.at[int(bus_idx), "name"]).strip()
+            if name and re.fullmatch(r"[-+]?\d+", name):
+                return int(name)
+        except Exception:
+            pass
+        return int(bus_idx) + 1
+
+    def _line_id_by_endpoints(net_obj: Any, fb: int, tb: int) -> Optional[int]:
+        if net_obj is None or not hasattr(net_obj, "line"):
+            return None
+        try:
+            for idx, row in net_obj.line.iterrows():
+                a = _bus_display_id_for_import(net_obj, int(row["from_bus"]))
+                b = _bus_display_id_for_import(net_obj, int(row["to_bus"]))
+                if (a == int(fb) and b == int(tb)) or (a == int(tb) and b == int(fb)):
+                    return int(idx)
+        except Exception:
+            return None
+        return None
+
+    raw_lines = payload.get("line_flows") or []
+    norm_lines: list[Dict[str, Any]] = []
+    net_obj = None
+    try:
+        net_obj = st.session_state.tool_ctx.net
+    except Exception:
+        net_obj = None
+    if isinstance(raw_lines, list):
+        for i, row in enumerate(raw_lines):
+            if not isinstance(row, dict):
+                continue
+            nr = dict(row)
+            # External JSONs often use null when RATE_A == 0; UI schema requires float.
+            if nr.get("loading_percent") is None:
+                nr["loading_percent"] = 0.0
+            mapped_id = None
+            try:
+                fb = int(nr.get("from_bus"))
+                tb = int(nr.get("to_bus"))
+                mapped_id = _line_id_by_endpoints(net_obj, fb, tb)
+            except Exception:
+                mapped_id = None
+
+            if mapped_id is not None:
+                nr["line_id"] = int(mapped_id)
+            else:
+                # Fallback keeps caller-provided id.
+                try:
+                    nr["line_id"] = int(nr.get("line_id", i + 1))
+                except Exception:
+                    nr["line_id"] = i + 1
+            norm_lines.append(nr)
+
     out: Dict[str, Any] = {
         "case_name": case_name,
         "converged": bool(payload.get("converged", True)),
         "bus_voltages": payload.get("bus_voltages") or [],
-        "line_flows": payload.get("line_flows") or [],
+        "line_flows": norm_lines,
         "total_generation_mw": payload.get("total_generation_mw", totals.get("total_generation_mw", 0.0)),
         "total_load_mw": payload.get("total_load_mw", totals.get("total_load_mw", 0.0)),
         "total_loss_mw": payload.get("total_loss_mw", totals.get("total_loss_mw", 0.0)),
@@ -617,6 +724,66 @@ def _import_external_llm_result(raw_text: str, T: Dict[str, str]) -> None:
     if cmp_note:
         msg = f"{msg}\n\n{cmp_note}"
     _append_ui_message("assistant", msg, plot_json=plot_json, extra_plots=extra_plots, result=result.model_dump())
+    st.rerun()
+
+
+def _benchmark_external_vs_truth(T: Dict[str, str]) -> None:
+    """Run PandaPower ground truth, compare with imported LLM result, render benchmark."""
+    import copy
+
+    ctx: ToolContext = st.session_state.tool_ctx
+    session: SessionState = st.session_state.session
+
+    if ctx.net is None:
+        _append_ui_message("assistant", T["need_case"])
+        st.rerun()
+        return
+
+    if session.last_result is None or "llm" not in str(getattr(session.last_result, "solver_backend", "")).lower():
+        _append_ui_message("assistant", T["benchmark_need_llm"])
+        st.rerun()
+        return
+
+    try:
+        net_copy = copy.deepcopy(ctx.net)
+        solver_cfg = SolverConfig(
+            v_min=float(st.session_state.get("v_min", DEFAULT_V_MIN)),
+            v_max=float(st.session_state.get("v_max", DEFAULT_V_MAX)),
+            max_loading=float(st.session_state.get("max_loading", DEFAULT_MAX_LOADING)),
+        )
+        truth = run_power_flow(net_copy, config=solver_cfg)
+        if not truth.converged:
+            raise RuntimeError("Ground truth power flow did not converge")
+
+        parsed = baseline_parsed_from_result(session.last_result)
+        metrics = evaluate_against_truth_extended(
+            parsed, truth,
+            v_min=solver_cfg.v_min,
+            v_max=solver_cfg.v_max,
+            max_loading=solver_cfg.max_loading,
+        )
+
+        lang = st.session_state.get("ui_lang", "en")
+        bench_fig = make_benchmark_figure(metrics, lang=lang)
+
+        extra_plots = [
+            {
+                "plot_type": "benchmark",
+                "figure_json": pio.to_json(bench_fig, validate=False),
+                "title": T["benchmark_title"],
+                "metrics": metrics,
+            }
+        ]
+
+        _append_ui_message(
+            "assistant",
+            T["benchmark_ok"],
+            extra_plots=extra_plots,
+            result=session.last_result.model_dump(),
+        )
+    except Exception as e:
+        _append_ui_message("assistant", T["benchmark_err"].format(err=f"{type(e).__name__}: {e}"))
+
     st.rerun()
 
 
@@ -749,7 +916,9 @@ def _build_flow_particle_html(fig_json: str, positions: Optional[Dict[int, tuple
         if not segs:
             return None
         return make_flow_particles_html(fig_json, segs, height_px=700)
-    except Exception:
+    except Exception as exc:
+        import logging
+        logging.getLogger(__name__).debug("Flow particle build failed: %s", exc, exc_info=True)
         return None
 
 
@@ -774,7 +943,7 @@ def _build_flow_plot_artifacts(
         session.last_result,
         positions=pos,
         use_ieee14_fixed_layout=False,
-        theme=_get_theme_base(),
+        theme=_get_plot_theme(),
         lang=st.session_state.get("ui_lang", "en"),
         **_flow_plot_kwargs(),
     )
@@ -898,6 +1067,106 @@ def _split_comparison_figure(fig: go.Figure, T: Dict[str, str]) -> list[go.Figur
     return out
 
 
+def _render_qc_summary_row(
+    ep: Dict[str, Any], mi: int, epi: int, T: Dict[str, str]
+) -> None:
+    """Render the summary metrics row below the quantitative comparison chart."""
+    before_dict = ep.get("before_result")
+    after_dict = ep.get("after_result")
+    if not before_dict or not after_dict:
+        return
+    try:
+        before_r = PowerFlowResult(**before_dict)
+        after_r = PowerFlowResult(**after_dict)
+    except Exception:
+        return
+
+    summaries = compute_comparison_summary(before_r, after_r)
+    lang = st.session_state.get("ui_lang", "en")
+    cols = st.columns(len(summaries))
+    for ci, (col, s) in enumerate(zip(cols, summaries)):
+        label = s["label_zh"] if lang == "zh" else s["label_en"]
+        text = s["fmt"](s["before"], s["after"], s["delta"])
+        if s["improved"]:
+            color = "#38A169"
+        elif s["worsened"]:
+            color = "#E53E3E"
+        else:
+            color = "#718096"
+        col.markdown(
+            f"<div style='text-align:center; padding:8px 4px; border-radius:8px; "
+            f"background:#fff; box-shadow:0 1px 2px rgba(0,0,0,0.06);'>"
+            f"<span style='font-family:Source Sans 3,sans-serif; font-size:12px; "
+            f"color:#718096;'>{label}</span><br>"
+            f"<span style='font-family:Source Sans 3,sans-serif; font-size:15px; "
+            f"font-weight:600; color:{color};'>{text}</span>"
+            f"</div>",
+            unsafe_allow_html=True,
+        )
+
+
+def _render_benchmark_cards(ep: Dict[str, Any], mi: int, epi: int, T: Dict[str, str]) -> None:
+    """Render 14 benchmark metric cards in tiered rows."""
+    metrics = ep.get("metrics")
+    if not metrics:
+        return
+
+    lang = st.session_state.get("ui_lang", "en")
+    cards = compute_benchmark_cards(metrics, lang=lang)
+
+    tier_labels = {
+        1: ("State Estimation Accuracy", "状态估计精度"),
+        2: ("Flow Estimation Accuracy", "潮流估计精度"),
+        3: ("Physical Consistency", "物理一致性"),
+        4: ("Advanced Metrics", "高级指标"),
+    }
+
+    tiers: Dict[int, list] = {}
+    for card in cards:
+        tiers.setdefault(card.get("tier", 0), []).append(card)
+
+    for tier_num in sorted(tiers.keys()):
+        tier_cards = tiers[tier_num]
+        label_en, label_zh = tier_labels.get(tier_num, (f"Tier {tier_num}", f"层级 {tier_num}"))
+        tier_label = label_zh if lang == "zh" else label_en
+
+        st.markdown(
+            f"<div style='margin-top:8px; margin-bottom:4px;'>"
+            f"<span style='font-family:Source Sans 3,sans-serif; font-size:13px; "
+            f"color:#4A5568; font-weight:600;'>{tier_label}</span></div>",
+            unsafe_allow_html=True,
+        )
+
+        cols = st.columns(len(tier_cards))
+        for ci, (col, card) in enumerate(zip(cols, tier_cards)):
+            label = card["label_zh"] if lang == "zh" else card["label_en"]
+            value = card["value"]
+            unit = card.get("unit", "")
+            color = card["color"]
+            fmt = card.get("fmt", ".4f")
+
+            if isinstance(value, bool):
+                display_val = "Yes" if value else "No"
+            elif value is None:
+                display_val = "N/A"
+            elif isinstance(value, float) and fmt:
+                display_val = f"{value:{fmt}}"
+            else:
+                display_val = str(value)
+
+            unit_str = f" {unit}" if unit else ""
+            col.markdown(
+                f"<div style='text-align:center; padding:8px 4px; border-radius:8px; "
+                f"background:#fff; box-shadow:0 1px 2px rgba(0,0,0,0.06);'>"
+                f"<span style='font-family:Source Sans 3,sans-serif; font-size:11px; "
+                f"color:#718096;'>{label}</span><br>"
+                f"<span style='font-family:Source Sans 3,sans-serif; font-size:15px; "
+                f"font-weight:600; color:{color};'>{display_val}{unit_str}</span>"
+                f"</div>",
+                unsafe_allow_html=True,
+            )
+
+
 def _render_result_details(result_dict: Dict[str, Any], T: Dict[str, str]) -> None:
     """Render structured result details in an expandable panel."""
     backend = str(result_dict.get("solver_backend") or st.session_state.get("solver_backend", "pandapower"))
@@ -1014,9 +1283,15 @@ def _build_all_plots_payload(T: Dict[str, str]) -> tuple[str, list[Dict[str, Any
     ctx: ToolContext = st.session_state.tool_ctx
     session: SessionState = st.session_state.session
     positions = _ensure_positions()
-    theme = _get_theme_base()
+    theme = _get_plot_theme()
 
-    voltage_fig = make_voltage_heatmap(ctx.net, session.last_result, positions=positions, theme=theme)
+    voltage_fig = make_voltage_heatmap(
+        ctx.net,
+        session.last_result,
+        positions=positions,
+        theme=theme,
+        lang=st.session_state.get("ui_lang", "en"),
+    )
     lang = st.session_state.get("ui_lang", "en")
     flow_json, flow_html = _build_flow_plot_artifacts(positions=positions)
     if flow_json is None:
@@ -1149,7 +1424,10 @@ def process_user_input(user_text: str, T: Dict[str, str]) -> None:
                 )
             else:
                 lang_locked_text = user_text + case_guard + "\n\n[语言要求：最终回答请仅使用中文。]"
-            assistant_text = engine.run(lang_locked_text, session)
+            try:
+                assistant_text = engine.run(lang_locked_text, session)
+            except Exception as e:
+                assistant_text = _format_llm_runtime_error(e, T)
         status.write(T["status_answer"])
         status.update(label=T["status_done"], state="complete")
 
@@ -1341,9 +1619,15 @@ def _plot_direct(plot_type: str, T: Dict[str, str]) -> None:
         return
 
     positions = _ensure_positions()
-    theme = _get_theme_base()
+    theme = _get_plot_theme()
     if plot_type == "voltage_heatmap":
-        fig = make_voltage_heatmap(ctx.net, session.last_result, positions=positions, theme=theme)
+        fig = make_voltage_heatmap(
+            ctx.net,
+            session.last_result,
+            positions=positions,
+            theme=theme,
+            lang=st.session_state.get("ui_lang", "en"),
+        )
         _append_ui_message(
             "assistant",
             ("📊 Plot generated." if T is EN else "📊 图表已生成。"),
@@ -1399,7 +1683,7 @@ def _run_n1_direct(T: Dict[str, str], *, top_k: int = 5) -> None:
         st.rerun()
         return
 
-    ctx.theme = _get_theme_base()
+    ctx.theme = _get_plot_theme()
     ctx.solver_config = SolverConfig(
         v_min=float(st.session_state.get("v_min", DEFAULT_V_MIN)),
         v_max=float(st.session_state.get("v_max", DEFAULT_V_MAX)),
@@ -1408,7 +1692,7 @@ def _run_n1_direct(T: Dict[str, str], *, top_k: int = 5) -> None:
 
     report = run_n1_contingency(ctx.net, top_k=int(top_k), criteria="max_violations", config=ctx.solver_config)
     session.last_n1_report = report
-    fig = make_n1_ranking(report, theme=_get_theme_base(), lang=st.session_state.get("ui_lang", "en"))
+    fig = make_n1_ranking(report, theme=_get_plot_theme(), lang=st.session_state.get("ui_lang", "en"))
     _append_ui_message(
         "assistant",
         ("🧨 N-1 analysis completed." if T is EN else "🧨 N-1 分析完成。"),
@@ -1451,7 +1735,7 @@ def _run_remedial_direct(T: Dict[str, str], *, max_actions: int = 5) -> None:
             st.rerun()
             return
 
-    ctx.theme = _get_theme_base()
+    ctx.theme = _get_plot_theme()
     ctx.solver_config = SolverConfig(
         v_min=float(st.session_state.get("v_min", DEFAULT_V_MIN)),
         v_max=float(st.session_state.get("v_max", DEFAULT_V_MAX)),
@@ -1491,7 +1775,7 @@ def _run_remedial_direct(T: Dict[str, str], *, max_actions: int = 5) -> None:
     session.last_remedial_plan = plan
     fig = make_remedial_ranking(
         plan,
-        theme=_get_theme_base(),
+        theme=_get_plot_theme(),
         lang=st.session_state.get("ui_lang", "en"),
     )
 
@@ -1503,7 +1787,7 @@ def _run_remedial_direct(T: Dict[str, str], *, max_actions: int = 5) -> None:
             session.last_result,
             plan.actions[0].preview_result,
             positions=positions,
-            theme=_get_theme_base(),
+            theme=_get_plot_theme(),
             lang=st.session_state.get("ui_lang", "en"),
         )
         extra_plots.append(
@@ -1513,6 +1797,27 @@ def _run_remedial_direct(T: Dict[str, str], *, max_actions: int = 5) -> None:
                 "title": ("Best Remedial Before/After" if T is EN else "最佳建议前后对比"),
             }
         )
+        # 4-panel quantitative comparison
+        try:
+            qc_fig = make_quantitative_comparison(
+                session.last_result,
+                plan.actions[0].preview_result,
+                vmin=ctx.solver_config.v_min,
+                vmax=ctx.solver_config.v_max,
+                max_loading=ctx.solver_config.max_loading,
+                lang=st.session_state.get("ui_lang", "en"),
+            )
+            extra_plots.append(
+                {
+                    "plot_type": "quantitative_comparison",
+                    "figure_json": pio.to_json(qc_fig, validate=False),
+                    "title": ("Quantitative Comparison" if T is EN else "量化对比视图"),
+                    "before_result": session.last_result.model_dump(),
+                    "after_result": plan.actions[0].preview_result.model_dump(),
+                }
+            )
+        except Exception:
+            pass
 
     _append_ui_message(
         "assistant",
@@ -1562,11 +1867,15 @@ def _apply_remedial_action_ui(action_index_0b: int, T: Dict[str, str]) -> None:
         v_max=float(st.session_state.get("v_max", DEFAULT_V_MAX)),
         max_loading=float(st.session_state.get("max_loading", DEFAULT_MAX_LOADING)),
     )
-    ctx.theme = _get_theme_base()
+    ctx.theme = _get_plot_theme()
+
+    # Push undo snapshot BEFORE modifying the network so we can rollback on failure.
+    _push_snapshot(label=f"pre_remedial:{action_index_0b + 1}")
 
     try:
         after = apply_remedial_action_inplace(ctx.net, act, config=ctx.solver_config)
     except Exception as e:
+        _undo_last()  # rollback the network to pre-modification state
         _append_ui_message("assistant", T["remedial_apply_failed"].format(err=f"{type(e).__name__}: {e}"))
         return
 
@@ -1594,12 +1903,35 @@ def _apply_remedial_action_ui(action_index_0b: int, T: Dict[str, str]) -> None:
             before,
             after,
             positions=positions,
-            theme=_get_theme_base(),
+            theme=_get_plot_theme(),
             lang=st.session_state.get("ui_lang", "en"),
         )
         cmp_json = pio.to_json(cmp_fig, validate=False)
     except Exception:
         cmp_json = None
+
+    # 4-panel quantitative comparison
+    qc_extra: list[Dict[str, Any]] = []
+    try:
+        qc_fig = make_quantitative_comparison(
+            before,
+            after,
+            vmin=ctx.solver_config.v_min,
+            vmax=ctx.solver_config.v_max,
+            max_loading=ctx.solver_config.max_loading,
+            lang=st.session_state.get("ui_lang", "en"),
+        )
+        qc_extra.append(
+            {
+                "plot_type": "quantitative_comparison",
+                "figure_json": pio.to_json(qc_fig, validate=False),
+                "title": ("Quantitative Comparison" if T is EN else "量化对比视图"),
+                "before_result": before.model_dump(),
+                "after_result": after.model_dump(),
+            }
+        )
+    except Exception:
+        pass
 
     text = T["remedial_applied"].format(idx=action_index_0b + 1, desc=act.description)
     if not after.converged:
@@ -1615,6 +1947,7 @@ def _apply_remedial_action_ui(action_index_0b: int, T: Dict[str, str]) -> None:
         text,
         plot_json=cmp_json,
         result=after.model_dump(),
+        extra_plots=qc_extra if qc_extra else None,
     )
 
     # 记录快照（用于撤销）
@@ -1945,6 +2278,27 @@ def main() -> None:
             if st.button(T["external_import_btn"], key="sidebar_import_external_llm_result", use_container_width=True):
                 _import_external_llm_result(raw_external, T)
 
+            has_llm_result = (
+                st.session_state.session.last_result is not None
+                and "llm" in str(getattr(st.session_state.session.last_result, "solver_backend", "")).lower()
+            )
+            if st.button(T["benchmark_btn"], key="sidebar_benchmark_vs_truth", use_container_width=True, disabled=not has_llm_result):
+                _benchmark_external_vs_truth(T)
+
+            cur_res = st.session_state.session.last_result
+            if cur_res is not None:
+                case_name = str(getattr(cur_res, "case_name", "") or st.session_state.session.active_case or "case")
+                export_name = f"pf_result_{case_name}.json"
+                export_json = json.dumps(cur_res.model_dump(), ensure_ascii=False, indent=2)
+                st.download_button(
+                    "Export current PF JSON" if T is EN else "导出当前 PF 结果 JSON",
+                    data=export_json,
+                    file_name=export_name,
+                    mime="application/json",
+                    key="sidebar_export_pf_json",
+                    use_container_width=True,
+                )
+
         st.divider()
         st.markdown(f"### {T['sidebar_n1']}")
         st.slider(T["sidebar_n1_topk"], 1, 20, 5, 1, key="n1_topk")
@@ -2110,6 +2464,42 @@ def main() -> None:
                                     key=f"chat_extra_plot_{mi}_{epi}_cmp_{pi}",
                                     config={"displaylogo": False},
                                 )
+                        elif ep.get("plot_type") == "quantitative_comparison":
+                            # White card container for quantitative comparison
+                            with st.container():
+                                st.markdown(
+                                    "<div style='background:#fff; border-radius:12px; padding:8px 4px; "
+                                    "box-shadow:0 1px 3px rgba(0,0,0,0.08);'>",
+                                    unsafe_allow_html=True,
+                                )
+                                fig2 = pio.from_json(ep["figure_json"])
+                                st.plotly_chart(
+                                    fig2,
+                                    use_container_width=True,
+                                    key=f"chat_extra_plot_{mi}_{epi}_qc",
+                                    config={"displaylogo": False},
+                                )
+                                st.markdown("</div>", unsafe_allow_html=True)
+
+                            # Summary metrics row
+                            _render_qc_summary_row(ep, mi, epi, T)
+                        elif ep.get("plot_type") == "benchmark":
+                            with st.container():
+                                st.markdown(
+                                    "<div style='background:#fff; border-radius:12px; padding:8px 4px; "
+                                    "box-shadow:0 1px 3px rgba(0,0,0,0.08);'>",
+                                    unsafe_allow_html=True,
+                                )
+                                fig2 = pio.from_json(ep["figure_json"])
+                                st.plotly_chart(
+                                    fig2,
+                                    use_container_width=True,
+                                    key=f"chat_extra_plot_{mi}_{epi}_bench",
+                                    config={"displaylogo": False},
+                                )
+                                st.markdown("</div>", unsafe_allow_html=True)
+
+                            _render_benchmark_cards(ep, mi, epi, T)
                         else:
                             fig2 = pio.from_json(ep["figure_json"])
                             st.plotly_chart(
@@ -2179,10 +2569,10 @@ def main() -> None:
             _run_pf_direct(T)
     with btn_cols[1]:
         if st.button(T["btn_v"], key="quick_voltage_map", use_container_width=True):
-            process_user_input("Show voltage map." if T is EN else "显示电压图。", T)
+            _plot_direct("voltage_heatmap", T)
     with btn_cols[2]:
         if st.button(T["btn_violation"], key="quick_violation_overview", use_container_width=True):
-            process_user_input("Show violation overview." if T is EN else "显示越限概览图。", T)
+            _plot_direct("violation_overview", T)
     with btn_cols[3]:
         with st.popover(T["btn_disconnect"], use_container_width=True):
             fb = st.number_input(T["disconnect_fb"], min_value=0, value=1, step=1)
@@ -2205,7 +2595,7 @@ def main() -> None:
             )
     with btn_cols[5]:
         if st.button(T["btn_remedial"], key="quick_generate_remedial", disabled=llm_only_active, use_container_width=True):
-            process_user_input("Generate remedial actions and comparison plot." if T is EN else "生成缓解建议并给出对比图。", T)
+            _run_remedial_direct(T, max_actions=5)
     with btn_cols[6]:
         if st.button("All Plots", key="quick_all_plots", use_container_width=True):
             _plot_all_direct(T)

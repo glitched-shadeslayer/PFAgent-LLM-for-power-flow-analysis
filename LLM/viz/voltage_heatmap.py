@@ -15,7 +15,7 @@ PRD 颜色语义：
 
 from __future__ import annotations
 
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
 import plotly.graph_objects as go
 
@@ -48,12 +48,17 @@ def make_voltage_heatmap(
     *,
     positions: Optional[dict[int, tuple[float, float]]] = None,
     theme: Theme = "light",
+    lang: Literal["zh", "en"] = "en",
     vmin: float = 0.90,
     vmax: float = 1.10,
 ) -> go.Figure:
     """生成电压热力图 Figure。"""
 
-    title = f"电压热力图 - {result.case_name}"
+    title = (
+        f"Voltage Heatmap - {result.case_name}"
+        if str(lang).lower().startswith("en")
+        else f"电压热力图 - {result.case_name}"
+    )
     fig, positions = make_base_network_figure(
         net,
         result,

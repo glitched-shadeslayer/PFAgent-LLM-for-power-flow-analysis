@@ -13,6 +13,7 @@ from viz.flow_diagram import make_flow_diagram
 from viz.comparison import make_comparison
 from viz.n1 import make_n1_ranking
 from viz.remedial import make_remedial_ranking
+from viz.benchmark import make_benchmark_figure, compute_benchmark_cards
 
 __all__ = [
     "make_base_network_figure",
@@ -22,4 +23,6 @@ __all__ = [
     "make_comparison",
     "make_n1_ranking",
     "make_remedial_ranking",
+    "make_benchmark_figure",
+    "compute_benchmark_cards",
 ]

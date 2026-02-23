@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any, Literal, Optional
 
+import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
@@ -371,3 +372,470 @@ def make_comparison(
         fig.update_yaxes(showgrid=False, zeroline=False, visible=False, row=r, col=c)
 
     return fig
+
+
+# ── 4-panel quantitative comparison ───────────────────────────────────────
+
+_FONT_SANS = "Source Sans 3, sans-serif"
+_FONT_SERIF = "Crimson Pro, serif"
+_BG_COLOR = "#FAFBFE"
+
+
+def _qc_font(size: int = 11, color: str = "#111827") -> dict:
+    return dict(size=size, family=_FONT_SANS, color=color)
+
+
+def make_quantitative_comparison(
+    before: PowerFlowResult,
+    after: PowerFlowResult,
+    *,
+    vmin: float = 0.95,
+    vmax: float = 1.05,
+    max_loading: float = 100.0,
+    lang: Literal["zh", "en"] = "zh",
+) -> go.Figure:
+    """Build a 2x2 quantitative comparison figure (voltage, delta-V, loading, table)."""
+
+    # ── Data extraction ──────────────────────────────────────────────────
+    before_vm = {int(b.bus_id): float(b.vm_pu) for b in before.bus_voltages}
+    after_vm = {int(b.bus_id): float(b.vm_pu) for b in after.bus_voltages}
+    all_bus_ids = sorted(set(before_vm.keys()) | set(after_vm.keys()))
+
+    bv = [before_vm.get(bid, 1.0) for bid in all_bus_ids]
+    av = [after_vm.get(bid, 1.0) for bid in all_bus_ids]
+    dv = [after_vm.get(bid, 1.0) - before_vm.get(bid, 1.0) for bid in all_bus_ids]
+    bus_labels = [str(bid) for bid in all_bus_ids]
+
+    # Line loading data
+    before_loading_map: dict[int, LineFlow] = {int(lf.line_id): lf for lf in before.line_flows}
+    after_loading_map: dict[int, LineFlow] = {int(lf.line_id): lf for lf in after.line_flows}
+    all_line_ids = sorted(set(before_loading_map.keys()) | set(after_loading_map.keys()))
+
+    if all_line_ids:
+        bl_series = pd.Series({lid: float(before_loading_map[lid].loading_percent) if lid in before_loading_map else 0.0 for lid in all_line_ids})
+        al_series = pd.Series({lid: float(after_loading_map[lid].loading_percent) if lid in after_loading_map else 0.0 for lid in all_line_ids})
+        max_loading_series = pd.concat([bl_series, al_series], axis=1).max(axis=1)
+        top15_idx = max_loading_series.nlargest(15).index.tolist()
+    else:
+        bl_series = pd.Series(dtype=float)
+        al_series = pd.Series(dtype=float)
+        top15_idx = []
+
+    def _line_label(lid: int) -> str:
+        lf = before_loading_map.get(lid) or after_loading_map.get(lid)
+        if lf is not None:
+            return f"{lf.from_bus}\u2192{lf.to_bus}"
+        return str(lid)
+
+    top15_labels = [_line_label(lid) for lid in top15_idx]
+    top15_before = [bl_series.get(lid, 0.0) for lid in top15_idx]
+    top15_after = [al_series.get(lid, 0.0) for lid in top15_idx]
+
+    # ── Subplot figure ───────────────────────────────────────────────────
+    fig = make_subplots(
+        rows=2,
+        cols=2,
+        specs=[
+            [{"type": "xy"}, {"type": "xy"}],
+            [{"type": "xy"}, {"type": "table"}],
+        ],
+        vertical_spacing=0.12,
+        horizontal_spacing=0.08,
+    )
+
+    # ── Panel 1 (top-left): Voltage magnitude comparison ─────────────────
+    all_vm = bv + av
+    y_lo = (min(all_vm) - 0.03) if all_vm else (vmin - 0.03)
+    y_hi = (max(all_vm) + 0.03) if all_vm else (vmax + 0.03)
+
+    # Violation shading: use x domain so rects span full axis regardless of category count
+    fig.add_shape(
+        type="rect", xref="x domain", yref="y",
+        x0=0, x1=1,
+        y0=y_lo, y1=vmin,
+        fillcolor="rgba(229,62,62,0.08)", line_width=0,
+        row=1, col=1,
+    )
+    fig.add_shape(
+        type="rect", xref="x domain", yref="y",
+        x0=0, x1=1,
+        y0=vmax, y1=y_hi,
+        fillcolor="rgba(229,62,62,0.08)", line_width=0,
+        row=1, col=1,
+    )
+
+    # Before trace — legendgroup links voltage + loading "Before" traces
+    before_label = "Before" if lang == "en" else "修改前"
+    after_label = "After" if lang == "en" else "修改后"
+
+    fig.add_trace(
+        go.Scatter(
+            x=bus_labels, y=bv,
+            mode="lines",
+            name=before_label,
+            line=dict(color="#3182CE", width=1.8, dash="dash"),
+            legendgroup="before",
+            showlegend=True,
+        ),
+        row=1, col=1,
+    )
+    # After trace
+    fig.add_trace(
+        go.Scatter(
+            x=bus_labels, y=av,
+            mode="lines+markers",
+            name=after_label,
+            line=dict(color="#E53E3E", width=2),
+            marker=dict(symbol="circle", size=6, color="#E53E3E"),
+            legendgroup="after",
+            showlegend=True,
+        ),
+        row=1, col=1,
+    )
+    # Limit lines
+    fig.add_hline(
+        y=vmin, line_dash="dash", line_color="#DD6B20", line_width=1.5,
+        row=1, col=1,
+    )
+    fig.add_hline(
+        y=vmax, line_dash="dash", line_color="#DD6B20", line_width=1.5,
+        row=1, col=1,
+    )
+    # Limit annotations
+    fig.add_annotation(
+        x=1.0, xref="x domain", xanchor="right",
+        y=vmin, yref="y",
+        text=f"{vmin} p.u.",
+        showarrow=False,
+        font=_qc_font(10, "#DD6B20"),
+        bgcolor="rgba(255,255,255,0.8)",
+        row=1, col=1,
+    )
+    fig.add_annotation(
+        x=1.0, xref="x domain", xanchor="right",
+        y=vmax, yref="y",
+        text=f"{vmax} p.u.",
+        showarrow=False,
+        font=_qc_font(10, "#DD6B20"),
+        bgcolor="rgba(255,255,255,0.8)",
+        row=1, col=1,
+    )
+
+    fig.update_xaxes(type="category", tickfont=_qc_font(9), row=1, col=1)
+    fig.update_yaxes(
+        range=[y_lo, y_hi],
+        title_text="V (p.u.)",
+        title_font=_qc_font(11),
+        tickfont=_qc_font(9),
+        gridcolor="#EDF2F7",
+        row=1, col=1,
+    )
+
+    # ── Panel 2 (top-right): ΔV bar chart ────────────────────────────────
+    bar_colors_dv = ["#38A169" if d >= 0 else "#E53E3E" for d in dv]
+
+    fig.add_trace(
+        go.Bar(
+            x=bus_labels, y=dv,
+            marker_color=bar_colors_dv,
+            name="\u0394V",
+            showlegend=False,
+            hovertemplate="Bus %{x}<br>\u0394V = %{y:+.4f} p.u.<extra></extra>",
+        ),
+        row=1, col=2,
+    )
+    # Zero line emphasis
+    fig.add_hline(y=0, line_color="#2D3748", line_width=1.5, row=1, col=2)
+
+    fig.update_xaxes(type="category", tickfont=_qc_font(9), row=1, col=2)
+    fig.update_yaxes(
+        title_text=("\u0394V (p.u.)" if lang == "en" else "\u0394V (p.u.)"),
+        title_font=_qc_font(11),
+        tickfont=_qc_font(9),
+        gridcolor="#EDF2F7",
+        row=1, col=2,
+    )
+
+    # ── Panel 3 (bottom-left): Top 15 line loading comparison ────────────
+    # Use same legendgroup as Panel 1 so toggling "Before"/"After" controls both
+    fig.add_trace(
+        go.Bar(
+            x=top15_labels, y=top15_before,
+            name=before_label,
+            marker_color="#3182CE",
+            legendgroup="before",
+            showlegend=False,
+        ),
+        row=2, col=1,
+    )
+    fig.add_trace(
+        go.Bar(
+            x=top15_labels, y=top15_after,
+            name=after_label,
+            marker_color="#E53E3E",
+            legendgroup="after",
+            showlegend=False,
+        ),
+        row=2, col=1,
+    )
+    # 100% threshold
+    fig.add_hline(
+        y=max_loading, line_dash="dash", line_color="#E53E3E", line_width=1.5,
+        row=2, col=1,
+    )
+
+    # Top annotations for bars > 80%
+    for i, (lb, la) in enumerate(zip(top15_before, top15_after)):
+        if lb > 80:
+            fig.add_annotation(
+                x=top15_labels[i], y=lb,
+                text=f"{lb:.0f}%",
+                showarrow=False, yshift=10,
+                font=_qc_font(8, "#3182CE"),
+                row=2, col=1,
+            )
+        if la > 80:
+            fig.add_annotation(
+                x=top15_labels[i], y=la,
+                text=f"{la:.0f}%",
+                showarrow=False, yshift=10,
+                font=_qc_font(8, "#E53E3E"),
+                row=2, col=1,
+            )
+
+    fig.update_xaxes(
+        type="category", tickfont=_qc_font(9), tickangle=-45,
+        row=2, col=1,
+    )
+    fig.update_yaxes(
+        title_text="Loading (%)",
+        title_font=_qc_font(11),
+        tickfont=_qc_font(9),
+        gridcolor="#EDF2F7",
+        row=2, col=1,
+    )
+
+    # ── Panel 4 (bottom-right): Key metrics table ────────────────────────
+    before_min_v = min((b.vm_pu for b in before.bus_voltages), default=1.0)
+    after_min_v = min((b.vm_pu for b in after.bus_voltages), default=1.0)
+    before_v_violations = len(before.voltage_violations)
+    after_v_violations = len(after.voltage_violations)
+    before_max_loading = max((l.loading_percent for l in before.line_flows), default=0.0)
+    after_max_loading = max((l.loading_percent for l in after.line_flows), default=0.0)
+    before_thermal_violations = len(before.thermal_violations)
+    after_thermal_violations = len(after.thermal_violations)
+    before_loss = before.total_loss_mw
+    after_loss = after.total_loss_mw
+    before_gen = before.total_generation_mw
+    after_gen = after.total_generation_mw
+
+    if lang == "zh":
+        metric_labels = ["最低电压 (p.u.)", "电压越限节点数", "最大负载率 (%)", "热稳越限线路数", "总损耗 (MW)", "总发电 (MW)"]
+    else:
+        metric_labels = ["Min Voltage (p.u.)", "V Violation Buses", "Max Loading (%)", "Thermal Violations", "Total Loss (MW)", "Total Gen (MW)"]
+
+    before_vals = [
+        f"{before_min_v:.4f}",
+        str(before_v_violations),
+        f"{before_max_loading:.1f}",
+        str(before_thermal_violations),
+        f"{before_loss:.2f}",
+        f"{before_gen:.2f}",
+    ]
+    after_vals = [
+        f"{after_min_v:.4f}",
+        str(after_v_violations),
+        f"{after_max_loading:.1f}",
+        str(after_thermal_violations),
+        f"{after_loss:.2f}",
+        f"{after_gen:.2f}",
+    ]
+
+    # Compute delta and color: improved=green, worsened=red, neutral=gray
+    raw_deltas = [
+        (after_min_v - before_min_v, True),           # higher min voltage = better
+        (after_v_violations - before_v_violations, False),  # fewer violations = better
+        (after_max_loading - before_max_loading, False),    # lower max loading = better
+        (after_thermal_violations - before_thermal_violations, False),
+        (after_loss - before_loss, False),                  # lower loss = better
+        (after_gen - before_gen, None),                     # neutral context
+    ]
+
+    delta_strs: list[str] = []
+    delta_colors: list[str] = []
+    for delta_val, higher_is_better in raw_deltas:
+        if abs(delta_val) < 1e-6:
+            delta_strs.append("-")
+            delta_colors.append("#A0AEC0")
+        elif higher_is_better is None:
+            delta_strs.append(f"{delta_val:+.2f}")
+            delta_colors.append("#A0AEC0")
+        elif higher_is_better:
+            improved = delta_val > 0
+            delta_strs.append(f"{delta_val:+.4f}" if abs(delta_val) < 1 else f"{delta_val:+.2f}")
+            delta_colors.append("#38A169" if improved else "#E53E3E")
+        else:
+            improved = delta_val < 0
+            # int deltas (violation counts) use compact format; float uses .2f
+            if isinstance(delta_val, int):
+                delta_strs.append(f"{delta_val:+d}")
+            else:
+                delta_strs.append(f"{delta_val:+.2f}")
+            delta_colors.append("#38A169" if improved else "#E53E3E")
+
+    header_label = (
+        [("指标" if lang == "zh" else "Metric"),
+         ("修改前" if lang == "zh" else "Before"),
+         ("修改后" if lang == "zh" else "After"),
+         ("变化" if lang == "zh" else "Change")]
+    )
+
+    n_rows = len(metric_labels)
+    cell_fills = [["#F7FAFC" if i % 2 == 0 else "#FFFFFF" for i in range(n_rows)] for _ in range(4)]
+    # Override the "Change" column with delta colors (lighter background tint)
+    cell_fills[3] = [
+        "#F0FFF4" if c == "#38A169" else ("#FFF5F5" if c == "#E53E3E" else "#F7FAFC")
+        for c in delta_colors
+    ]
+
+    # Per-column font colors: first 3 columns use default text, last column uses delta colors
+    default_text = "#111827"
+    font_colors = [
+        [default_text] * n_rows,
+        [default_text] * n_rows,
+        [default_text] * n_rows,
+        delta_colors,
+    ]
+
+    fig.add_trace(
+        go.Table(
+            header=dict(
+                values=header_label,
+                fill_color="#2B6CB0",
+                font=dict(color="white", size=12, family=_FONT_SANS),
+                align="center",
+                height=30,
+            ),
+            cells=dict(
+                values=[
+                    metric_labels,
+                    before_vals,
+                    after_vals,
+                    delta_strs,
+                ],
+                fill_color=cell_fills,
+                font=dict(size=11, family=_FONT_SANS, color=font_colors),
+                align=["left", "center", "center", "center"],
+                height=26,
+            ),
+        ),
+        row=2, col=2,
+    )
+
+    # ── Subplot title annotations ────────────────────────────────────────
+    panel_titles = (
+        ["电压幅值对比", "\u0394V 电压变化量", "线路负载率对比 (Top 15)", "关键指标对比"]
+        if lang == "zh"
+        else ["Voltage Magnitude", "\u0394V Change", "Line Loading (Top 15)", "Key Metrics"]
+    )
+
+    # x/y positions for subplot title annotations (above each subplot)
+    title_positions = [
+        (0.22, 1.06),   # top-left
+        (0.78, 1.06),   # top-right
+        (0.22, 0.46),   # bottom-left
+        (0.78, 0.46),   # bottom-right
+    ]
+    for (tx, ty), ttxt in zip(title_positions, panel_titles):
+        fig.add_annotation(
+            text=f"<b>{ttxt}</b>",
+            x=tx, y=ty,
+            xref="paper", yref="paper",
+            xanchor="center", yanchor="bottom",
+            showarrow=False,
+            font=dict(size=14, family=_FONT_SERIF, color="#111827"),
+        )
+
+    # ── Global layout ────────────────────────────────────────────────────
+    main_title = "量化对比视图" if lang == "zh" else "Quantitative Comparison"
+    case_name = after.case_name or before.case_name or ""
+
+    fig.update_layout(
+        title=dict(
+            text=(
+                f"<span style='font-family:{_FONT_SERIF}; font-size:18px'>"
+                f"{main_title}</span><br>"
+                f"<span style='font-family:{_FONT_SANS}; font-size:12px; color:#718096'>"
+                f"{case_name}</span>"
+            ),
+            x=0.01, xanchor="left", y=0.98, yanchor="top",
+        ),
+        height=700,
+        paper_bgcolor=_BG_COLOR,
+        plot_bgcolor=_BG_COLOR,
+        template="plotly_white",
+        margin=dict(l=50, r=30, t=90, b=60),
+        font=_qc_font(),
+        legend=dict(
+            orientation="h",
+            yanchor="bottom", y=1.08,
+            xanchor="left", x=0.01,
+            font=_qc_font(11),
+            bgcolor="rgba(250,251,254,0.88)",
+            borderwidth=0,
+        ),
+        barmode="group",
+    )
+
+    return fig
+
+
+def compute_comparison_summary(
+    before: PowerFlowResult,
+    after: PowerFlowResult,
+    *,
+    max_loading: float = 100.0,
+) -> list[dict]:
+    """Return summary metrics for the Streamlit bottom row.
+
+    Each dict has: label, before, after, delta, improved (bool).
+    """
+    bv = len(before.voltage_violations)
+    av = len(after.voltage_violations)
+    bt = len(before.thermal_violations)
+    at_ = len(after.thermal_violations)
+    bl = before.total_loss_mw
+    al = after.total_loss_mw
+
+    return [
+        {
+            "label_zh": "电压越限",
+            "label_en": "V Violations",
+            "before": bv,
+            "after": av,
+            "delta": av - bv,
+            "improved": av < bv,
+            "worsened": av > bv,
+            "fmt": lambda b, a, d: f"{b} \u2192 {a} (\u2193{abs(d)})" if d < 0 else (f"{b} \u2192 {a} (\u2191{abs(d)})" if d > 0 else f"{b} \u2192 {a}"),
+        },
+        {
+            "label_zh": "热稳越限",
+            "label_en": "Thermal Violations",
+            "before": bt,
+            "after": at_,
+            "delta": at_ - bt,
+            "improved": at_ < bt,
+            "worsened": at_ > bt,
+            "fmt": lambda b, a, d: f"{b} \u2192 {a} (\u2193{abs(d)})" if d < 0 else (f"{b} \u2192 {a} (\u2191{abs(d)})" if d > 0 else f"{b} \u2192 {a}"),
+        },
+        {
+            "label_zh": "总损耗",
+            "label_en": "Total Loss",
+            "before": bl,
+            "after": al,
+            "delta": al - bl,
+            "improved": al < bl,
+            "worsened": al > bl,
+            "fmt": lambda b, a, d: f"{b:.1f} \u2192 {a:.1f} MW (\u2193{abs(d):.1f})" if d < 0 else (f"{b:.1f} \u2192 {a:.1f} MW (\u2191{abs(d):.1f})" if d > 0 else f"{b:.1f} \u2192 {a:.1f} MW"),
+        },
+    ]

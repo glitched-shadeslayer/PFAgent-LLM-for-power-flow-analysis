@@ -5,7 +5,9 @@
 - 默认阈值参数（电压越限、热稳定越限）
 
 说明：
-- Streamlit 部署时建议通过环境变量注入，不要把 key 写进代码库。
+- Streamlit Cloud 部署时通过 st.secrets 注入密钥。
+- 本地开发时使用 .env.local 文件。
+- 优先级：环境变量 > st.secrets > .env.local
 """
 
 from __future__ import annotations
@@ -52,32 +54,47 @@ def _load_local_env_defaults() -> None:
 _load_local_env_defaults()
 
 
+def _get_secret(name: str, default: str | None = None) -> str | None:
+    """Read a config value: env var > st.secrets > default."""
+    val = os.getenv(name)
+    if val:
+        return val
+    try:
+        import streamlit as st  # noqa: F811
+        val = st.secrets.get(name)
+        if val:
+            return str(val)
+    except Exception:
+        pass
+    return default
+
+
 # -----------------------------
 # LLM
 # -----------------------------
 
-OPENAI_API_KEY: str | None = os.getenv("OPENAI_API_KEY")
-OPENAI_MODEL: str = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-OPENAI_TEMPERATURE: float = float(os.getenv("OPENAI_TEMPERATURE", "0.0"))
-OPENAI_TIMEOUT_S: float = float(os.getenv("OPENAI_TIMEOUT_S", "60"))
+OPENAI_API_KEY: str | None = _get_secret("OPENAI_API_KEY")
+OPENAI_MODEL: str = _get_secret("OPENAI_MODEL", "gpt-4o-mini")  # type: ignore[assignment]
+OPENAI_TEMPERATURE: float = float(_get_secret("OPENAI_TEMPERATURE", "0.0"))  # type: ignore[arg-type]
+OPENAI_TIMEOUT_S: float = float(_get_secret("OPENAI_TIMEOUT_S", "60"))  # type: ignore[arg-type]
 
 GEMINI_API_KEY: str | None = (
-    os.getenv("GEMINI_API_KEY")
-    or os.getenv("GOOGLE_API_KEY")
+    _get_secret("GEMINI_API_KEY")
+    or _get_secret("GOOGLE_API_KEY")
 )
-GEMINI_MODEL: str = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite")
-GEMINI_TEMPERATURE: float = float(os.getenv("GEMINI_TEMPERATURE", os.getenv("LLM_TEMPERATURE", "0.0")))
-GEMINI_TIMEOUT_S: float = float(os.getenv("GEMINI_TIMEOUT_S", os.getenv("LLM_TIMEOUT_S", "60")))
+GEMINI_MODEL: str = _get_secret("GEMINI_MODEL", "gemini-2.5-flash-lite")  # type: ignore[assignment]
+GEMINI_TEMPERATURE: float = float(_get_secret("GEMINI_TEMPERATURE", _get_secret("LLM_TEMPERATURE", "0.0")))  # type: ignore[arg-type]
+GEMINI_TIMEOUT_S: float = float(_get_secret("GEMINI_TIMEOUT_S", _get_secret("LLM_TIMEOUT_S", "60")))  # type: ignore[arg-type]
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
-    raw = str(os.getenv(name, "1" if default else "0")).strip().lower()
+    raw = str(_get_secret(name, "1" if default else "0")).strip().lower()
     return raw in {"1", "true", "t", "yes", "y", "on"}
 
 
 # MATPOWER text dataset (for blueprint-mode llm_only)
-MATPOWER_DATA_ROOT: str = os.getenv("MATPOWER_DATA_ROOT", "data/matpower")
-MATPOWER_CASE_DATE: str = os.getenv("MATPOWER_CASE_DATE", "2017-01-01")
+MATPOWER_DATA_ROOT: str = _get_secret("MATPOWER_DATA_ROOT", "data/matpower")  # type: ignore[assignment]
+MATPOWER_CASE_DATE: str = _get_secret("MATPOWER_CASE_DATE", "2017-01-01")  # type: ignore[assignment]
 LLM_ONLY_DEBUG_MODE: bool = _env_bool("LLM_ONLY_DEBUG_MODE", default=False)
 
 
@@ -85,6 +102,6 @@ LLM_ONLY_DEBUG_MODE: bool = _env_bool("LLM_ONLY_DEBUG_MODE", default=False)
 # Validation thresholds
 # -----------------------------
 
-DEFAULT_V_MIN: float = float(os.getenv("V_MIN", "0.95"))
-DEFAULT_V_MAX: float = float(os.getenv("V_MAX", "1.05"))
-DEFAULT_MAX_LOADING: float = float(os.getenv("MAX_LOADING", "100"))
+DEFAULT_V_MIN: float = float(_get_secret("V_MIN", "0.95"))  # type: ignore[arg-type]
+DEFAULT_V_MAX: float = float(_get_secret("V_MAX", "1.05"))  # type: ignore[arg-type]
+DEFAULT_MAX_LOADING: float = float(_get_secret("MAX_LOADING", "100"))  # type: ignore[arg-type]

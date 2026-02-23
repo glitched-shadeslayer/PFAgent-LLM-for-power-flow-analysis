@@ -10,6 +10,7 @@ from baselines.llm_only import (
     BaselineParsed,
     build_baseline_prompt,
     evaluate_against_truth,
+    evaluate_against_truth_extended,
     export_case_tables,
     parse_llm_baseline_json,
     run_baseline_case,
@@ -120,3 +121,41 @@ def test_metrics_zero_error_when_matching_truth():
     assert metrics["voltage_violation_recall"] == 1.0
     assert metrics["thermal_violation_precision"] == 1.0
     assert metrics["thermal_violation_recall"] == 1.0
+
+
+def test_metrics_align_by_branch_endpoints_when_line_id_semantics_differ():
+    net, _ = case_loader.load("case14")
+    truth = run_power_flow(net)
+    assert truth.converged
+
+    shifted = []
+    for lf in truth.line_flows:
+        shifted.append(
+            {
+                # Simulate MATPOWER-style 1-based line IDs in external result.
+                "line_id": int(lf.line_id) + 1,
+                "from_bus": int(lf.from_bus),
+                "to_bus": int(lf.to_bus),
+                "p_from_mw": float(lf.p_from_mw),
+                "loading_percent": float(lf.loading_percent),
+            }
+        )
+
+    obj = {
+        "converged": True,
+        "bus_voltages": [
+            {"bus_id": int(b.bus_id), "vm_pu": float(b.vm_pu), "va_deg": float(b.va_deg)}
+            for b in truth.bus_voltages
+        ],
+        "line_flows": shifted,
+        "total_generation_mw": float(truth.total_generation_mw),
+        "total_load_mw": float(truth.total_load_mw),
+        "total_loss_mw": float(truth.total_loss_mw),
+    }
+
+    parsed, err = BaselineParsed.from_json(obj)
+    assert err is None and parsed is not None
+
+    metrics = evaluate_against_truth_extended(parsed, truth)
+    assert metrics["flow_rmse"] == pytest.approx(0.0, abs=1e-12)
+    assert metrics["flow_mae"] == pytest.approx(0.0, abs=1e-12)
