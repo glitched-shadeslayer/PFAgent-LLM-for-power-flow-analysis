@@ -305,6 +305,14 @@ def apply_remedial_action_inplace(
     *,
     config: SolverConfig,
 ) -> Any:
+    """Apply a remedial action to *net* **in-place** and re-run power flow.
+
+    .. warning::
+        The caller MUST push an undo snapshot **before** calling this function.
+        If the power flow fails after network modification the net state is left
+        as-is (modified but without valid results).  Use the undo snapshot to
+        restore the previous state in that case.
+    """
     if net is None:
         raise ValueError("net cannot be None")
     if action is None:

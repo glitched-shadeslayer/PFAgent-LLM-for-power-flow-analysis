@@ -506,7 +506,13 @@ def build_default_dispatcher(ctx: ToolContext) -> ToolDispatcher:
 
         fig = None
         if plot_type == "voltage_heatmap":
-            fig = make_voltage_heatmap(ctx.net, ctx.session.last_result, positions=positions, theme=theme)
+            fig = make_voltage_heatmap(
+                ctx.net,
+                ctx.session.last_result,
+                positions=positions,
+                theme=theme,
+                lang=_lang(),
+            )
         elif plot_type == "flow_diagram":
             fig = make_flow_diagram(ctx.net, ctx.session.last_result, positions=positions, theme=theme, lang=_lang())
         elif plot_type == "violation_overview":

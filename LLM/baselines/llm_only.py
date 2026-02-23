@@ -21,7 +21,7 @@ import math
 import os
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -295,6 +295,7 @@ class BaselineParsed:
     total_generation_mw: float
     total_load_mw: float
     total_loss_mw: float
+    line_ends: Dict[int, Tuple[int, int]] = field(default_factory=dict)
 
     @staticmethod
     def from_json(obj: Dict[str, Any]) -> Tuple[Optional["BaselineParsed"], Optional[str]]:
@@ -340,6 +341,7 @@ class BaselineParsed:
 
         line_p: Dict[int, float] = {}
         line_loading: Dict[int, float] = {}
+        line_ends: Dict[int, Tuple[int, int]] = {}
         for item in line_items:
             try:
                 lid = int(item.get("line_id"))
@@ -348,6 +350,10 @@ class BaselineParsed:
                 if _finite(p) and _finite(ld):
                     line_p[lid] = p
                     line_loading[lid] = ld
+                fb = item.get("from_bus")
+                tb = item.get("to_bus")
+                if fb is not None and tb is not None:
+                    line_ends[lid] = (int(fb), int(tb))
             except Exception:
                 continue
 
@@ -367,12 +373,76 @@ class BaselineParsed:
                 bus_va=bus_va,
                 line_p=line_p,
                 line_loading=line_loading,
+                line_ends=line_ends,
                 total_generation_mw=tg,
                 total_load_mw=tl,
                 total_loss_mw=tlo,
             ),
             None,
         )
+
+
+def baseline_parsed_from_result(result: "PowerFlowResult") -> "BaselineParsed":
+    """Convert a PowerFlowResult (e.g. from external LLM import) to BaselineParsed."""
+    return BaselineParsed(
+        converged=bool(result.converged),
+        bus_vm={int(b.bus_id): float(b.vm_pu) for b in result.bus_voltages},
+        bus_va={int(b.bus_id): float(b.va_deg) for b in result.bus_voltages},
+        line_p={int(l.line_id): float(l.p_from_mw) for l in result.line_flows},
+        line_loading={int(l.line_id): float(l.loading_percent) for l in result.line_flows},
+        line_ends={int(l.line_id): (int(l.from_bus), int(l.to_bus)) for l in result.line_flows},
+        total_generation_mw=float(result.total_generation_mw),
+        total_load_mw=float(result.total_load_mw),
+        total_loss_mw=float(result.total_loss_mw),
+    )
+
+
+def _build_truth_line_maps(
+    parsed: BaselineParsed,
+    truth: "PowerFlowResult",
+) -> Tuple[Dict[int, float], Dict[int, float], Dict[int, int], Dict[int, int], set[int]]:
+    """
+    Build truth line maps in the same key-space as parsed lines.
+    Prefer endpoint matching when parsed contains (from_bus, to_bus), because
+    external/LLM results often use MATPOWER 1-based line_id while pandapower truth
+    uses 0-based line index.
+    """
+
+    truth_p_by_id = {int(l.line_id): float(l.p_from_mw) for l in truth.line_flows}
+    truth_loading_by_id = {int(l.line_id): float(l.loading_percent) for l in truth.line_flows}
+    truth_from_by_id = {int(l.line_id): int(l.from_bus) for l in truth.line_flows}
+    truth_to_by_id = {int(l.line_id): int(l.to_bus) for l in truth.line_flows}
+    truth_thermal_ids = {int(l.line_id) for l in truth.thermal_violations}
+
+    common_by_id = set(parsed.line_p.keys()) & set(truth_p_by_id.keys())
+
+    # Endpoint-based alignment: map truth values into parsed line_id keys.
+    if parsed.line_ends:
+        by_edge: Dict[Tuple[int, int], Any] = {
+            (int(l.from_bus), int(l.to_bus)): l for l in truth.line_flows
+        }
+        p_map: Dict[int, float] = {}
+        loading_map: Dict[int, float] = {}
+        from_map: Dict[int, int] = {}
+        to_map: Dict[int, int] = {}
+        thermal_map: set[int] = set()
+
+        for parsed_lid, (fb, tb) in parsed.line_ends.items():
+            lf = by_edge.get((int(fb), int(tb)))
+            if lf is None:
+                continue
+            p_map[int(parsed_lid)] = float(lf.p_from_mw)
+            loading_map[int(parsed_lid)] = float(lf.loading_percent)
+            from_map[int(parsed_lid)] = int(lf.from_bus)
+            to_map[int(parsed_lid)] = int(lf.to_bus)
+            if int(lf.line_id) in truth_thermal_ids:
+                thermal_map.add(int(parsed_lid))
+
+        # Use endpoint alignment only when it gives at least as much overlap.
+        if len(p_map) >= max(1, len(common_by_id)):
+            return p_map, loading_map, from_map, to_map, thermal_map
+
+    return truth_p_by_id, truth_loading_by_id, truth_from_by_id, truth_to_by_id, truth_thermal_ids
 
 
 # ---------------------------
@@ -409,7 +479,7 @@ def evaluate_against_truth(
     """计算 baseline 输出与求解器真值的误差与越限识别指标。"""
 
     truth_vm = {int(b.bus_id): float(b.vm_pu) for b in truth.bus_voltages}
-    truth_p = {int(l.line_id): float(l.p_from_mw) for l in truth.line_flows}
+    truth_p, _, _, _, truth_t = _build_truth_line_maps(parsed, truth)
 
     vm_pairs = [(parsed.bus_vm[i], truth_vm[i]) for i in parsed.bus_vm.keys() & truth_vm.keys()]
     p_pairs = [(parsed.line_p[i], truth_p[i]) for i in parsed.line_p.keys() & truth_p.keys()]
@@ -422,7 +492,6 @@ def evaluate_against_truth(
     truth_v = {int(b.bus_id) for b in truth.voltage_violations}
 
     pred_t = {i for i, ld in parsed.line_loading.items() if ld > max_loading}
-    truth_t = {int(l.line_id) for l in truth.thermal_violations}
 
     v_prec, v_rec = _set_precision_recall(pred_v, truth_v)
     t_prec, t_rec = _set_precision_recall(pred_t, truth_t)
@@ -449,6 +518,207 @@ def evaluate_against_truth(
         "pred_thermal_violations": sorted(pred_t),
         "truth_thermal_violations": sorted(truth_t),
     }
+
+
+def _f1(prec: Optional[float], rec: Optional[float]) -> Optional[float]:
+    if prec is None or rec is None:
+        return None
+    if prec + rec == 0:
+        return 0.0
+    return float(2.0 * prec * rec / (prec + rec))
+
+
+def _confusion_matrix(pred: set[int], truth: set[int], all_ids: set[int]) -> Dict[str, int]:
+    tp = len(pred & truth)
+    fp = len(pred - truth)
+    fn = len(truth - pred)
+    tn = len(all_ids - pred - truth)
+    return {"tp": tp, "fp": fp, "fn": fn, "tn": tn}
+
+
+def evaluate_against_truth_extended(
+    parsed: BaselineParsed,
+    truth: "PowerFlowResult",
+    *,
+    v_min: float = 0.95,
+    v_max: float = 1.05,
+    max_loading: float = 100.0,
+    top_k_weak: int = 5,
+) -> Dict[str, Any]:
+    """Extended benchmark metrics: 14 scientific indicators + raw data for visualization."""
+
+    # Start from base metrics
+    base = evaluate_against_truth(parsed, truth, v_min=v_min, v_max=v_max, max_loading=max_loading)
+
+    # Build aligned arrays
+    truth_vm = {int(b.bus_id): float(b.vm_pu) for b in truth.bus_voltages}
+    truth_va = {int(b.bus_id): float(b.va_deg) for b in truth.bus_voltages}
+    truth_p, truth_loading, truth_from, truth_to, truth_t_set = _build_truth_line_maps(parsed, truth)
+
+    common_buses = sorted(parsed.bus_vm.keys() & truth_vm.keys())
+    common_lines = sorted(parsed.line_p.keys() & truth_p.keys())
+    common_loading = sorted(parsed.line_loading.keys() & truth_loading.keys())
+
+    # --- Tier 1: State Estimation Accuracy ---
+    voltage_rmse = None
+    voltage_mape = None
+    voltage_max_error = None
+    angle_rmse = None
+
+    if common_buses:
+        vm_llm = np.array([parsed.bus_vm[i] for i in common_buses])
+        vm_true = np.array([truth_vm[i] for i in common_buses])
+        vm_diff = vm_llm - vm_true
+
+        voltage_rmse = float(np.sqrt(np.mean(vm_diff ** 2)))
+        nonzero_mask = np.abs(vm_true) > 1e-9
+        if nonzero_mask.any():
+            voltage_mape = float(np.mean(np.abs(vm_diff[nonzero_mask]) / np.abs(vm_true[nonzero_mask])) * 100.0)
+        voltage_max_error = float(np.max(np.abs(vm_diff)))
+
+        common_angles = sorted(parsed.bus_va.keys() & truth_va.keys())
+        if common_angles:
+            va_llm = np.array([parsed.bus_va[i] for i in common_angles])
+            va_true = np.array([truth_va[i] for i in common_angles])
+            angle_rmse = float(np.sqrt(np.mean((va_llm - va_true) ** 2)))
+
+    # --- Tier 2: Flow Estimation Accuracy ---
+    flow_rmse = None
+    flow_max_error = None
+    flow_p95_error = None
+    loading_rmse = None
+
+    if common_lines:
+        p_llm = np.array([parsed.line_p[i] for i in common_lines])
+        p_true = np.array([truth_p[i] for i in common_lines])
+        p_diff = p_llm - p_true
+        p_abs_diff = np.abs(p_diff)
+
+        flow_rmse = float(np.sqrt(np.mean(p_diff ** 2)))
+        flow_max_error = float(np.max(p_abs_diff))
+        flow_p95_error = float(np.percentile(p_abs_diff, 95))
+
+    if common_loading:
+        ld_llm = np.array([parsed.line_loading[i] for i in common_loading])
+        ld_true = np.array([truth_loading[i] for i in common_loading])
+        loading_rmse = float(np.sqrt(np.mean((ld_llm - ld_true) ** 2)))
+
+    # --- Tier 3: Physical Consistency ---
+    power_balance_error = float(abs(
+        parsed.total_generation_mw - parsed.total_load_mw - parsed.total_loss_mw
+    ))
+
+    # KCL violation rate: for each bus, compare sum of incident line flows (LLM vs truth)
+    kcl_violation_rate = None
+    if common_lines and common_buses:
+        # Build per-bus net injection from line flows
+        bus_flow_llm: Dict[int, float] = {}
+        bus_flow_truth: Dict[int, float] = {}
+        for lid in common_lines:
+            fb = truth_from.get(lid)
+            tb = truth_to.get(lid)
+            if fb is None or tb is None:
+                continue
+            p_l = parsed.line_p[lid]
+            p_t = truth_p[lid]
+            # from_bus: flow out is positive
+            bus_flow_llm[fb] = bus_flow_llm.get(fb, 0.0) + p_l
+            bus_flow_truth[fb] = bus_flow_truth.get(fb, 0.0) + p_t
+            bus_flow_llm[tb] = bus_flow_llm.get(tb, 0.0) - p_l
+            bus_flow_truth[tb] = bus_flow_truth.get(tb, 0.0) - p_t
+
+        kcl_buses = sorted(bus_flow_llm.keys() & bus_flow_truth.keys())
+        if kcl_buses:
+            kcl_tol = 1.0  # MW tolerance
+            n_violated = sum(
+                1 for b in kcl_buses
+                if abs(bus_flow_llm[b] - bus_flow_truth[b]) > kcl_tol
+            )
+            kcl_violation_rate = float(n_violated / len(kcl_buses) * 100.0)
+
+    # F1 scores
+    v_prec = base.get("voltage_violation_precision")
+    v_rec = base.get("voltage_violation_recall")
+    t_prec = base.get("thermal_violation_precision")
+    t_rec = base.get("thermal_violation_recall")
+    voltage_f1 = _f1(v_prec, v_rec)
+    thermal_f1 = _f1(t_prec, t_rec)
+
+    convergence_match = bool(parsed.converged == truth.converged)
+
+    # --- Tier 4: Advanced ---
+    flow_direction_accuracy = None
+    if common_lines:
+        near_zero_tol = 0.01
+        n_correct = 0
+        n_total = 0
+        for lid in common_lines:
+            p_l = parsed.line_p[lid]
+            p_t = truth_p[lid]
+            if abs(p_t) < near_zero_tol and abs(p_l) < near_zero_tol:
+                n_correct += 1
+            elif (p_l > 0) == (p_t > 0):
+                n_correct += 1
+            n_total += 1
+        if n_total > 0:
+            flow_direction_accuracy = float(n_correct / n_total * 100.0)
+
+    critical_bus_jaccard = None
+    if common_buses and len(common_buses) >= top_k_weak:
+        truth_weakest = set(sorted(common_buses, key=lambda b: truth_vm[b])[:top_k_weak])
+        pred_weakest = set(sorted(common_buses, key=lambda b: parsed.bus_vm[b])[:top_k_weak])
+        union = truth_weakest | pred_weakest
+        if union:
+            critical_bus_jaccard = float(len(truth_weakest & pred_weakest) / len(union))
+
+    # --- Raw data for visualization (JSON-serializable) ---
+    raw_vm_pairs = [[i, float(parsed.bus_vm[i]), float(truth_vm[i])] for i in common_buses]
+    raw_va_pairs = [
+        [i, float(parsed.bus_va[i]), float(truth_va[i])]
+        for i in sorted(parsed.bus_va.keys() & truth_va.keys())
+    ]
+    raw_p_pairs = [[i, float(parsed.line_p[i]), float(truth_p[i])] for i in common_lines]
+
+    # Confusion matrices
+    pred_v_set = {i for i, v in parsed.bus_vm.items() if v < v_min or v > v_max}
+    truth_v_set = {int(b.bus_id) for b in truth.voltage_violations}
+    all_bus_ids = set(parsed.bus_vm.keys()) | set(truth_vm.keys())
+    violation_cm = _confusion_matrix(pred_v_set, truth_v_set, all_bus_ids)
+
+    pred_t_set = {i for i, ld in parsed.line_loading.items() if ld > max_loading}
+    all_line_ids = set(parsed.line_loading.keys()) | set(truth_loading.keys())
+    thermal_cm = _confusion_matrix(pred_t_set, truth_t_set, all_line_ids)
+
+    # Merge all into result
+    extended = dict(base)
+    extended.update({
+        # Tier 1
+        "voltage_rmse": voltage_rmse,
+        "voltage_mape": voltage_mape,
+        "voltage_max_error": voltage_max_error,
+        "angle_rmse": angle_rmse,
+        # Tier 2
+        "flow_rmse": flow_rmse,
+        "flow_max_error": flow_max_error,
+        "flow_p95_error": flow_p95_error,
+        "loading_rmse": loading_rmse,
+        # Tier 3
+        "power_balance_error": power_balance_error,
+        "kcl_violation_rate": kcl_violation_rate,
+        "voltage_f1": voltage_f1,
+        "thermal_f1": thermal_f1,
+        "convergence_match": convergence_match,
+        # Tier 4
+        "flow_direction_accuracy": flow_direction_accuracy,
+        "critical_bus_jaccard": critical_bus_jaccard,
+        # Raw data for visualization
+        "_raw_vm_pairs": raw_vm_pairs,
+        "_raw_va_pairs": raw_va_pairs,
+        "_raw_p_pairs": raw_p_pairs,
+        "_violation_cm": violation_cm,
+        "_thermal_cm": thermal_cm,
+    })
+    return extended
 
 
 # ---------------------------
