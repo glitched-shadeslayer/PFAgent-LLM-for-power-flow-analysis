@@ -29,6 +29,26 @@ def test_voltage_heatmap_returns_figure(case_name: str):
     assert hasattr(fig, "data")
     assert len(fig.data) >= 1
     assert case_name in fig.layout.title.text
+    assert any(getattr(t, "showlegend", False) for t in fig.data)
+    assert fig.layout.yaxis.scaleanchor == "x"
+
+
+def test_voltage_heatmap_colors_apply_to_bus_trace_only():
+    net, _ = case_loader.load("case14")
+    res = run_power_flow(net)
+    fig = make_voltage_heatmap(net, res)
+
+    bus_trace = next((t for t in fig.data if getattr(t, "name", "") == "bus"), None)
+    assert bus_trace is not None
+    assert len(bus_trace.x or []) == len(net.bus)
+    assert len(bus_trace.marker.color or []) == len(net.bus)
+
+    hover_trace = next(
+        (t for t in fig.data if getattr(t, "mode", None) == "markers" and str(getattr(t, "name", "")) == ""),
+        None,
+    )
+    if hover_trace is not None:
+        assert str(hover_trace.marker.color) == "rgba(0,0,0,0)"
 
 
 @pytest.mark.parametrize("case_name", ["case14", "case30"])
@@ -49,6 +69,24 @@ def test_violation_overview_returns_figure():
     assert "case14" in (fig.layout.title.text or "")
 
 
+def test_violation_overview_uses_pf_like_layout_case14():
+    net, _ = case_loader.load("case14")
+    res = run_power_flow(net)
+    fig = make_violation_overview(net, res)
+
+    assert fig.layout.yaxis.scaleanchor == "x"
+    assert fig.layout.legend.orientation == "h"
+
+    xr = list(fig.layout.xaxis.range or [])
+    yr = list(fig.layout.yaxis.range or [])
+    assert len(xr) == 2
+    assert len(yr) == 2
+    assert xr[0] == pytest.approx(-1.9, abs=1e-6)
+    assert xr[1] == pytest.approx(10.9, abs=1e-6)
+    assert yr[0] == pytest.approx(-0.8, abs=1e-6)
+    assert yr[1] == pytest.approx(8.8, abs=1e-6)
+
+
 def test_comparison_returns_figure_with_table():
     net, _ = case_loader.load("case14")
     before = run_power_flow(net)
@@ -65,6 +103,16 @@ def test_comparison_returns_figure_with_table():
     assert "case14" in (fig.layout.title.text or "")
     # last trace should be table
     assert any(t.type == "table" for t in fig.data)
+    assert fig.layout.yaxis.scaleanchor == "x"
+    assert fig.layout.yaxis2.scaleanchor == "x2"
+    xr1 = list(fig.layout.xaxis.range or [])
+    yr1 = list(fig.layout.yaxis.range or [])
+    xr2 = list(fig.layout.xaxis2.range or [])
+    yr2 = list(fig.layout.yaxis2.range or [])
+    assert xr1 == pytest.approx([-1.9, 10.9], abs=1e-6)
+    assert yr1 == pytest.approx([-0.8, 8.8], abs=1e-6)
+    assert xr2 == pytest.approx([-1.9, 10.9], abs=1e-6)
+    assert yr2 == pytest.approx([-0.8, 8.8], abs=1e-6)
 
 
 def test_generate_plot_tool_outputs_json():

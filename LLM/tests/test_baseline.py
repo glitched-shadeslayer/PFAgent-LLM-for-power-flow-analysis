@@ -1,3 +1,4 @@
+import copy
 import sys
 from pathlib import Path
 
@@ -8,6 +9,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from baselines.llm_only import (
     BaselineParsed,
+    baseline_parsed_from_result,
     build_baseline_prompt,
     evaluate_against_truth,
     evaluate_against_truth_extended,
@@ -159,3 +161,39 @@ def test_metrics_align_by_branch_endpoints_when_line_id_semantics_differ():
     metrics = evaluate_against_truth_extended(parsed, truth)
     assert metrics["flow_rmse"] == pytest.approx(0.0, abs=1e-12)
     assert metrics["flow_mae"] == pytest.approx(0.0, abs=1e-12)
+
+
+def test_metrics_direction_invariant_when_line_endpoints_reversed():
+    net, _ = case_loader.load("case14")
+    truth = run_power_flow(net)
+    assert truth.converged
+
+    parsed = baseline_parsed_from_result(truth)
+    parsed_rev = copy.deepcopy(parsed)
+    parsed_rev.line_ends = {lid: (tb, fb) for lid, (fb, tb) in parsed.line_ends.items()}
+    parsed_rev.line_p = {lid: -float(p) for lid, p in parsed.line_p.items()}
+
+    metrics = evaluate_against_truth_extended(parsed_rev, truth, net=net)
+    assert metrics["flow_mae"] == pytest.approx(0.0, abs=1e-9)
+    assert metrics["flow_deviation_rate"] == pytest.approx(0.0, abs=1e-9)
+    assert metrics["kcl_self_violation_rate"] == pytest.approx(0.0, abs=1e-9)
+    assert metrics["kcl_max_mismatch_mw"] == pytest.approx(0.0, abs=1e-6)
+
+
+def test_kcl_metrics_still_detect_perturbation_under_reversed_orientation():
+    net, _ = case_loader.load("case14")
+    truth = run_power_flow(net)
+    assert truth.converged
+
+    parsed = baseline_parsed_from_result(truth)
+    parsed_rev = copy.deepcopy(parsed)
+    parsed_rev.line_ends = {lid: (tb, fb) for lid, (fb, tb) in parsed.line_ends.items()}
+    parsed_rev.line_p = {lid: -float(p) for lid, p in parsed.line_p.items()}
+
+    for lid in sorted(parsed_rev.line_p.keys())[:5]:
+        parsed_rev.line_p[lid] = float(parsed_rev.line_p[lid]) * 1.3
+
+    metrics = evaluate_against_truth_extended(parsed_rev, truth, net=net)
+    assert float(metrics["flow_deviation_rate"]) > 0.0
+    assert float(metrics["kcl_self_violation_rate"]) > 0.0
+    assert float(metrics["kcl_max_mismatch_mw"]) > 1.0
