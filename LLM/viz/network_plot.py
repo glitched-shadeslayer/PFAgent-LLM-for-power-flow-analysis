@@ -466,6 +466,27 @@ def make_base_network_figure(
     return fig, positions
 
 
+def _axis_ranges_like_pf(
+    positions: dict[int, tuple[float, float]],
+    *,
+    force_ieee14: bool,
+) -> tuple[list[float], list[float]]:
+    """Axis ranges aligned with PF/voltage-map framing."""
+    if force_ieee14:
+        return [-1.9, 10.9], [-0.8, 8.8]
+    xs = [float(v[0]) for v in positions.values()]
+    ys = [float(v[1]) for v in positions.values()]
+    if not xs or not ys:
+        return [-1.0, 1.0], [-1.0, 1.0]
+    xmin, xmax = min(xs), max(xs)
+    ymin, ymax = min(ys), max(ys)
+    dx = max(1e-6, xmax - xmin)
+    dy = max(1e-6, ymax - ymin)
+    pad_x = 0.12 * dx
+    pad_y = 0.12 * dy
+    return [xmin - pad_x, xmax + pad_x], [ymin - pad_y, ymax + pad_y]
+
+
 def make_violation_overview(
     net: Any,
     result: PowerFlowResult,
@@ -476,9 +497,21 @@ def make_violation_overview(
 ) -> go.Figure:
     """Violation overview with only violating elements strongly emphasized."""
 
+    # Local import avoids module-level circular dependency:
+    # flow_diagram -> network_plot, so we import resolver only when needed.
+    from viz.flow_diagram import resolve_flow_positions
+
     g = build_graph(net)
-    if positions is None:
-        positions = compute_layout(net, g)
+    positions = resolve_flow_positions(
+        net,
+        result,
+        positions=positions,
+        use_ieee14_fixed_layout=True,
+        graph=g,
+    )
+    force_ieee14 = str(getattr(result, "case_name", "") or "").lower() == "case14"
+    xr, yr = _axis_ranges_like_pf(positions, force_ieee14=force_ieee14)
+
     slack, pv, pq, inactive = classify_bus_sets(net)
     btype_map: dict[int, str] = {int(b): "other" for b in g.nodes}
     for b in inactive:
@@ -613,12 +646,19 @@ def make_violation_overview(
     )
 
     fig.update_layout(
-        title=(f"Violation Overview - {result.case_name}" if lang == "en" else f"越限概览图 - {result.case_name}"),
+        title=dict(
+            text=(f"Violation Overview - {result.case_name}" if lang == "en" else f"越限概览图 - {result.case_name}"),
+            x=0.02,
+            xanchor="left",
+            y=0.98,
+            yanchor="top",
+        ),
         template=_template(theme),
-        margin=dict(l=10, r=10, t=60, b=10),
+        height=640,
+        margin=dict(l=16, r=24, t=72, b=14),
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0.0),
-        xaxis=dict(showgrid=False, zeroline=False, visible=False),
-        yaxis=dict(showgrid=False, zeroline=False, visible=False),
+        xaxis=dict(showgrid=False, zeroline=False, visible=False, range=xr),
+        yaxis=dict(showgrid=False, zeroline=False, visible=False, range=yr, scaleanchor="x"),
     )
     return fig
 

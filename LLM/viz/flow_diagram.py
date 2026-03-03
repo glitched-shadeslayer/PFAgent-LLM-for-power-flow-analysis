@@ -101,12 +101,26 @@ def _palette(scheme: ColorScheme, theme: Theme) -> dict[str, str]:
     }
 
 
-def _load_level(loading: float, heavy_th: float, over_th: float) -> str:
+def _load_level_key(loading: float, heavy_th: float, over_th: float) -> str:
     if loading >= over_th:
-        return "Overloaded"
+        return "over"
     if loading >= heavy_th:
-        return "Heavy load"
-    return "Light load"
+        return "heavy"
+    return "light"
+
+
+def _load_level_label(level_key: str, lang: str) -> str:
+    if lang == "zh":
+        return {
+            "light": "轻载",
+            "heavy": "重载",
+            "over": "过载",
+        }.get(level_key, level_key)
+    return {
+        "light": "Light load",
+        "heavy": "Heavy load",
+        "over": "Overloaded",
+    }.get(level_key, level_key)
 
 
 def _line_color(loading: float, heavy_th: float, over_th: float, pal: dict[str, str]) -> str:
@@ -349,11 +363,27 @@ def make_flow_diagram(
         bdf = bdf.copy()
         bdf["from_bus_raw"] = bdf["from_bus"].astype(int)
         bdf["to_bus_raw"] = bdf["to_bus"].astype(int)
-    p_max = float(bdf["p_from_mw"].abs().max()) if not bdf.empty else 1.0
+    p_max = max(1e-6, float(bdf["p_from_mw"].abs().max())) if not bdf.empty else 1.0
     show_power_labels_eff = bool(show_power_labels) and n_bus <= 50
     show_flow_arrows_eff = bool(show_flow_arrows)
     line_scale = 0.7 if n_bus > 100 else 1.0
     node_scale = 0.6 if n_bus > 100 else 1.0
+    is_en = str(lang).lower().startswith("en")
+    label_branch = "Branch" if is_en else "支路"
+    label_bus = "Bus" if is_en else "母线"
+    label_raw = "raw" if is_en else "原始"
+    label_angle = "Angle" if is_en else "相角"
+    label_p_inj = "P_inj" if is_en else "有功注入"
+    label_q_inj = "Q_inj" if is_en else "无功注入"
+    label_level = "Level" if is_en else "负载等级"
+    legend_light = "Light load" if is_en else "轻载"
+    legend_heavy = "Heavy load" if is_en else "重载"
+    legend_over = "Overloaded" if is_en else "过载"
+    legend_slack = "Slack bus" if is_en else "平衡母线"
+    legend_pv = "PV bus" if is_en else "PV 母线"
+    legend_pq = "PQ bus" if is_en else "PQ 母线"
+    slack_text = "<b>Slack</b>" if is_en else "<b>平衡</b>"
+    base_text = "Base: 100 MVA" if is_en else "基准: 100 MVA"
 
     # Branches + arrows + labels
     for _, br in bdf.iterrows():
@@ -364,7 +394,8 @@ def make_flow_diagram(
         p_mw = float(br["p_from_mw"])
         q_mvar = float(br["q_from_mvar"])
         loading = float(br["loading_percent"])
-        level = _load_level(loading, heavy_threshold, over_threshold)
+        level_key = _load_level_key(loading, heavy_threshold, over_threshold)
+        level = _load_level_label(level_key, "en" if is_en else "zh")
         color = _line_color(loading, heavy_threshold, over_threshold, pal)
         width = _line_width(abs(p_mw), p_max) * line_scale
 
@@ -376,10 +407,10 @@ def make_flow_diagram(
                 line=dict(color=color, width=width),
                 opacity=0.82,
                 hovertemplate=(
-                    f"Branch {int(br['from_bus'])}->{int(br['to_bus'])}<br>"
+                    f"{label_branch} {int(br['from_bus'])}->{int(br['to_bus'])}<br>"
                     f"P={p_mw:.2f} MW<br>"
                     f"Q={q_mvar:.2f} Mvar<br>"
-                    f"Level={level}<extra></extra>"
+                    f"{label_level}={level}<extra></extra>"
                 ),
                 showlegend=False,
             )
@@ -493,11 +524,11 @@ def make_flow_diagram(
                 mode="markers",
                 marker=marker,
                 hovertemplate=(
-                    f"Bus {bid}" + (f" (raw {bid_raw})" if use_dense_labels else "") + "<br>"
+                    f"{label_bus} {bid}" + (f" ({label_raw} {bid_raw})" if use_dense_labels else "") + "<br>"
                     f"V={vm:.3f} p.u.<br>"
-                    f"Angle={va:.2f} deg<br>"
-                    f"P_inj={pinj:.2f} MW<br>"
-                    f"Q_inj={qinj:.2f} Mvar<extra></extra>"
+                    f"{label_angle}={va:.2f} deg<br>"
+                    f"{label_p_inj}={pinj:.2f} MW<br>"
+                    f"{label_q_inj}={qinj:.2f} Mvar<extra></extra>"
                 ),
                 showlegend=False,
             )
@@ -517,7 +548,7 @@ def make_flow_diagram(
             fig.add_annotation(
                 x=x,
                 y=y - slack_text_dy,
-                text="<b>Slack</b>",
+                text=slack_text,
                 showarrow=False,
                 font=dict(size=9, color=pal["slack_edge"], family="Times New Roman, serif"),
             )
@@ -531,16 +562,16 @@ def make_flow_diagram(
             )
 
     # Legend (3 line levels + 3 bus types)
-    fig.add_trace(go.Scatter(x=[None], y=[None], mode="lines", line=dict(color=pal["light"], width=2.5), name="Light load", showlegend=True))
-    fig.add_trace(go.Scatter(x=[None], y=[None], mode="lines", line=dict(color=pal["heavy"], width=3.5), name="Heavy load", showlegend=True))
-    fig.add_trace(go.Scatter(x=[None], y=[None], mode="lines", line=dict(color=pal["over"], width=4.5), name="Overloaded", showlegend=True))
+    fig.add_trace(go.Scatter(x=[None], y=[None], mode="lines", line=dict(color=pal["light"], width=2.5), name=legend_light, showlegend=True))
+    fig.add_trace(go.Scatter(x=[None], y=[None], mode="lines", line=dict(color=pal["heavy"], width=3.5), name=legend_heavy, showlegend=True))
+    fig.add_trace(go.Scatter(x=[None], y=[None], mode="lines", line=dict(color=pal["over"], width=4.5), name=legend_over, showlegend=True))
     fig.add_trace(
         go.Scatter(
             x=[None],
             y=[None],
             mode="markers",
             marker=dict(symbol="square", size=12, color=pal["slack_fill"], line=dict(color=pal["slack_edge"], width=2)),
-            name="Slack bus",
+            name=legend_slack,
             showlegend=True,
         )
     )
@@ -550,7 +581,7 @@ def make_flow_diagram(
             y=[None],
             mode="markers",
             marker=dict(symbol="circle", size=12, color=pal["pv_fill"], line=dict(color=pal["pv_edge"], width=2)),
-            name="PV bus",
+            name=legend_pv,
             showlegend=True,
         )
     )
@@ -560,14 +591,14 @@ def make_flow_diagram(
             y=[None],
             mode="markers",
             marker=dict(symbol="circle", size=10, color=pal["pq_fill"], line=dict(color=pal["pq_edge"], width=1.5)),
-            name="PQ bus",
+            name=legend_pq,
             showlegend=True,
         )
     )
 
     force_ieee14 = bool(use_ieee14_fixed_layout and case_name.lower() == "case14")
     xr, yr = _axis_ranges(positions, force_ieee14=force_ieee14)
-    if lang == "en":
+    if is_en:
         title = (
             f"Power Flow Distribution - {case_name} (IEEE 14-Bus System)"
             if case_name.lower() == "case14"
@@ -575,9 +606,9 @@ def make_flow_diagram(
         )
     else:
         title = (
-            f"潮流分布图 - {case_name} (IEEE 14节点)"
+            f"\u6f6e\u6d41\u5206\u5e03\u56fe - {case_name} (IEEE 14\u8282\u70b9)"
             if case_name.lower() == "case14"
-            else f"潮流分布图 - {case_name}"
+            else f"\u6f6e\u6d41\u5206\u5e03\u56fe - {case_name}"
         )
     fig.update_layout(
         title=title,
@@ -606,7 +637,7 @@ def make_flow_diagram(
         yref="paper",
         xanchor="right",
         yanchor="bottom",
-        text="Base: 100 MVA",
+        text=base_text,
         showarrow=False,
         font=dict(size=11, color=pal["text"], family="Times New Roman, serif"),
         bgcolor=pal["label_bg"],

@@ -1,10 +1,13 @@
-﻿"""Main Streamlit app entrypoint."""
+"""Main Streamlit app entrypoint."""
 
 from __future__ import annotations
 
 import copy
+from html import escape
 import json
+import os
 import re
+import uuid
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -98,7 +101,7 @@ ZH = {
     "case_loaded": "已加载系统：{case}",
     "need_case": "请先加载一个测试系统。",
     "need_result": "请先运行潮流计算后再作图。",
-    "report_todo": "报告导出功能后续实现。",
+    "report_todo": "报告已生成，请点击下方按钮下载。",
     "undo_done": "已撤销上一步修改。",
     "remedial_apply": "应用",
     "remedial_confirm_title": "确认应用缓解建议",
@@ -168,7 +171,7 @@ EN = {
     "case_loaded": "Loaded case: {case}",
     "need_case": "Please load a test case first.",
     "need_result": "Please run power flow first before plotting.",
-    "report_todo": "Report export will be implemented later.",
+    "report_todo": "Report generated. Click below to download.",
     "undo_done": "Undone the last change.",
     "remedial_apply": "Apply",
     "remedial_confirm_title": "Confirm applying remedial action",
@@ -217,17 +220,13 @@ OPENAI_MODEL_LABELS = {
 
 GEMINI_MODELS = [
     "gemini-2.5-flash-lite",
-    "gemini-2.5-flash",
-    "gemma-3-12b-it",
-    "gemma-3-27b-it",
-    "gemini-3-flash",
+    "gemini-3-flash-preview",
+    "gemini-3.1-pro-preview",
 ]
 GEMINI_MODEL_LABELS = {
-    "gemma-3-12b-it": "Gemma 3 12B",
-    "gemma-3-27b-it": "Gemma 3 27B",
-    "gemini-3-flash": "Gemini 3 Flash",
     "gemini-2.5-flash-lite": "Gemini 2.5 Flash Lite",
-    "gemini-2.5-flash": "Gemini 2.5 Flash",
+    "gemini-3-flash-preview": "Gemini 3 Flash Preview",
+    "gemini-3.1-pro-preview": "Gemini 3.1 Pro Preview",
 }
 
 
@@ -260,32 +259,37 @@ def _init_state() -> None:
     if "pending_remedial_apply" not in st.session_state:
         st.session_state.pending_remedial_apply = None  # {"index": int, "source": str}
     if "llm_provider" not in st.session_state:
-        if GEMINI_API_KEY:
+        default_gemini_key = _provider_default_key("gemini")
+        default_openai_key = _provider_default_key("openai")
+        if default_gemini_key:
             st.session_state.llm_provider = "gemini"
-        elif OPENAI_API_KEY:
+        elif default_openai_key:
             st.session_state.llm_provider = "openai"
         else:
             st.session_state.llm_provider = "gemini"
-    if "llm_api_key" not in st.session_state:
-        if st.session_state.llm_provider == "gemini":
-            st.session_state.llm_api_key = GEMINI_API_KEY or ""
+    # Restore API key: per-provider backup > legacy backup > env default > empty
+    _saved_by_provider = st.session_state.get("_saved_api_key_by_provider", {})
+    if not isinstance(_saved_by_provider, dict):
+        _saved_by_provider = {}
+    current_provider = str(st.session_state.get("llm_provider", "gemini"))
+    _saved_key = str(
+        _saved_by_provider.get(current_provider)
+        or st.session_state.get("_saved_api_key", "")
+        or ""
+    ).strip()
+    if "llm_api_key" not in st.session_state or not str(st.session_state.get("llm_api_key", "")).strip():
+        if _saved_key:
+            st.session_state.llm_api_key = _saved_key
         else:
-            st.session_state.llm_api_key = OPENAI_API_KEY or ""
-    elif not str(st.session_state.get("llm_api_key", "")).strip():
-        default_key = GEMINI_API_KEY if st.session_state.llm_provider == "gemini" else OPENAI_API_KEY
-        if default_key:
-            st.session_state.llm_api_key = default_key
+            st.session_state.llm_api_key = _provider_default_key(str(st.session_state.llm_provider))
     if "llm_model" not in st.session_state:
-        if st.session_state.llm_provider == "gemini":
-            st.session_state.llm_model = GEMINI_MODEL
-        else:
-            st.session_state.llm_model = OPENAI_MODEL
+        st.session_state.llm_model = _provider_default_model(str(st.session_state.llm_provider))
     if "llm_last_model_by_provider" not in st.session_state:
         current_provider = str(st.session_state.get("llm_provider", "gemini"))
-        current_model = str(st.session_state.get("llm_model", GEMINI_MODEL if current_provider == "gemini" else OPENAI_MODEL))
+        current_model = str(st.session_state.get("llm_model", _provider_default_model(current_provider)))
         st.session_state.llm_last_model_by_provider = {
-            "gemini": current_model if current_provider == "gemini" else GEMINI_MODEL,
-            "openai": current_model if current_provider == "openai" else OPENAI_MODEL,
+            "gemini": current_model if current_provider == "gemini" else _provider_default_model("gemini"),
+            "openai": current_model if current_provider == "openai" else _provider_default_model("openai"),
         }
     if "llm_temperature" not in st.session_state:
         if st.session_state.llm_provider == "gemini":
@@ -394,11 +398,9 @@ def _list_gemini_models_dynamic(api_key: str) -> tuple[list[str], Optional[str]]
                 continue
             seen.add(mid)
             model_list.append(mid)
-        # Keep a sensible fallback default visible.
-        if GEMINI_MODEL and GEMINI_MODEL not in seen:
-            model_list.append(GEMINI_MODEL)
-        if not model_list:
-            model_list = list(GEMINI_MODELS)
+        # Keep Gemini selector stable: only expose curated models in configured order.
+        curated = [m for m in GEMINI_MODELS if m in seen]
+        model_list = curated if curated else list(GEMINI_MODELS)
         cache[key] = {"models": model_list, "error": None}
         return model_list, None
     except Exception as e:
@@ -419,16 +421,43 @@ def _model_label(provider: str, model_id: str) -> str:
     return OPENAI_MODEL_LABELS.get(model_id, model_id)
 
 
+def _runtime_local_env() -> dict[str, str]:
+    """Read .env.local at runtime — local dev only, skipped on cloud."""
+    if _is_cloud_deployment():
+        return {}
+    env_path = Path(__file__).resolve().parent / ".env.local"
+    try:
+        return _parse_env_local(env_path)
+    except Exception:
+        return {}
+
+
 def _provider_default_model(provider: str) -> str:
+    local_env = _runtime_local_env()
     if provider == "gemini":
-        return GEMINI_MODEL
-    return OPENAI_MODEL
+        return (
+            str(local_env.get("GEMINI_MODEL") or "").strip()
+            or GEMINI_MODEL
+        )
+    return (
+        str(local_env.get("OPENAI_MODEL") or "").strip()
+        or OPENAI_MODEL
+    )
 
 
 def _provider_default_key(provider: str) -> str:
+    """Return a pre-fill API key ONLY from .env.local (local dev).
+
+    On Streamlit Cloud (no .env.local), returns "" so the sidebar
+    starts empty and visitors must type their own key.
+    """
+    local_env = _runtime_local_env()
     if provider == "gemini":
-        return GEMINI_API_KEY or ""
-    return OPENAI_API_KEY or ""
+        return (
+            str(local_env.get("GEMINI_API_KEY") or "").strip()
+            or str(local_env.get("GOOGLE_API_KEY") or "").strip()
+        )
+    return str(local_env.get("OPENAI_API_KEY") or "").strip()
 
 
 def _resolve_llm_settings() -> tuple[str, str, str]:
@@ -555,11 +584,27 @@ def _parse_env_local(path: Path) -> dict[str, str]:
     return out
 
 
+def _is_cloud_deployment() -> bool:
+    """Detect Streamlit Cloud (or similar) where we must NOT persist user keys."""
+    # Streamlit Cloud sets HOSTNAME to a container id and lacks common local markers.
+    import platform
+    home = os.environ.get("HOME", "")
+    # Streamlit Cloud: Linux container, HOME=/home/appuser
+    if platform.system() == "Linux" and "appuser" in home:
+        return True
+    # Generic: if env explicitly says cloud
+    if os.environ.get("STREAMLIT_SHARING_MODE") or os.environ.get("IS_CLOUD"):
+        return True
+    return False
+
+
 def _persist_insecure_api_key(provider: str, api_key: str, model: Optional[str] = None) -> None:
     """
-    Intentionally insecure: store API key in plain text `.env.local`.
-    Silently skips on read-only filesystems (e.g. Streamlit Cloud).
+    Local dev only: store API key in plain text `.env.local` for convenience.
+    DISABLED on cloud deployments to prevent one user's key leaking to others.
     """
+    if _is_cloud_deployment():
+        return
     env_path = Path(__file__).resolve().parent / ".env.local"
     try:
         env_map = _parse_env_local(env_path)
@@ -758,6 +803,7 @@ def _benchmark_external_vs_truth(T: Dict[str, str]) -> None:
         parsed = baseline_parsed_from_result(session.last_result)
         metrics = evaluate_against_truth_extended(
             parsed, truth,
+            net=net_copy,
             v_min=solver_cfg.v_min,
             v_max=solver_cfg.v_max,
             max_loading=solver_cfg.max_loading,
@@ -922,6 +968,480 @@ def _build_flow_particle_html(fig_json: str, positions: Optional[Dict[int, tuple
         return None
 
 
+def _build_animated_plot_html(fig_json: str, plot_type: str) -> Optional[tuple[str, int]]:
+    """Build self-animated Plotly HTML for selected chart types."""
+    pt = str(plot_type or "").strip().lower()
+    if pt not in {"voltage_heatmap", "violation_overview", "comparison_panel"}:
+        return None
+
+    try:
+        fig = pio.from_json(fig_json)
+        fig_dict = fig.to_plotly_json()
+    except Exception:
+        return None
+
+    data = list(fig_dict.get("data") or [])
+    layout = dict(fig_dict.get("layout") or {})
+    js_anim_lines: list[str] = []
+
+    if pt == "comparison_panel":
+        # "After" panel animation should affect only changed branches / buses.
+        def _is_red_change_style(v: Any) -> bool:
+            s = str(v or "").strip().lower().replace(" ", "")
+            return (
+                "#d62728" in s
+                or "rgba(214,39,40" in s
+                or "rgb(214,39,40" in s
+                or "214,39,40" in s
+            )
+
+        pulse_lines: list[dict[str, Any]] = []
+        pulse_nodes: list[dict[str, Any]] = []
+        for i, tr in enumerate(data):
+            if not isinstance(tr, dict):
+                continue
+            tr_type = str(tr.get("type", "")).lower()
+            if tr_type == "table":
+                continue
+
+            mode = str(tr.get("mode", "")).lower()
+            x_raw = tr.get("x")
+            y_raw = tr.get("y")
+            if isinstance(x_raw, (list, tuple)):
+                has_real_points = not (len(x_raw) > 0 and x_raw[0] is None)
+            else:
+                has_real_points = x_raw is not None
+            if not has_real_points:
+                continue
+
+            try:
+                base_opacity = float(tr.get("opacity", 1.0))
+            except Exception:
+                base_opacity = 1.0
+
+            if tr_type == "scatter" and "lines" in mode:
+                line_cfg = dict(tr.get("line") or {})
+                line_color_raw = line_cfg.get("color")
+                line_dash = str(line_cfg.get("dash", "")).lower()
+                # In comparison "After", changed branches are red dashed lines.
+                if _is_red_change_style(line_color_raw) and "dash" in line_dash:
+                    try:
+                        base_w = float(line_cfg.get("width", 4.0))
+                    except Exception:
+                        base_w = 4.0
+                    pulse_lines.append(
+                        {
+                            "idx": i,
+                            "base": max(1.0, base_w),
+                            "op": max(0.2, min(1.0, base_opacity)),
+                        }
+                    )
+
+            if tr_type == "scatter" and "markers" in mode:
+                marker_cfg = dict(tr.get("marker") or {})
+                line_cfg = dict(marker_cfg.get("line") or {})
+                line_color_raw = line_cfg.get("color")
+                n_pts = 0
+                if isinstance(x_raw, (list, tuple)):
+                    n_pts = len(x_raw)
+                elif isinstance(y_raw, (list, tuple)):
+                    n_pts = len(y_raw)
+                if n_pts <= 0:
+                    continue
+
+                changed_idx: list[int] = []
+                if isinstance(line_color_raw, (list, tuple)):
+                    for j, c in enumerate(line_color_raw):
+                        if j >= n_pts:
+                            break
+                        if _is_red_change_style(c):
+                            changed_idx.append(j)
+                else:
+                    if _is_red_change_style(line_color_raw):
+                        changed_idx = list(range(n_pts))
+
+                if not changed_idx:
+                    continue
+
+                size_raw = marker_cfg.get("size", 12.0)
+                if isinstance(size_raw, (list, tuple)):
+                    base_sizes: list[float] = []
+                    for j in range(n_pts):
+                        if j < len(size_raw):
+                            try:
+                                base_sizes.append(float(size_raw[j]))
+                            except Exception:
+                                base_sizes.append(12.0)
+                        else:
+                            base_sizes.append(12.0)
+                else:
+                    try:
+                        s0 = float(size_raw)
+                    except Exception:
+                        s0 = 12.0
+                    base_sizes = [s0 for _ in range(n_pts)]
+
+                lw_raw = line_cfg.get("width", 2.0)
+                if isinstance(lw_raw, (list, tuple)):
+                    base_lws: list[float] = []
+                    for j in range(n_pts):
+                        if j < len(lw_raw):
+                            try:
+                                base_lws.append(float(lw_raw[j]))
+                            except Exception:
+                                base_lws.append(1.0)
+                        else:
+                            base_lws.append(1.0)
+                else:
+                    try:
+                        w0 = float(lw_raw)
+                    except Exception:
+                        w0 = 2.0
+                    base_lws = [w0 for _ in range(n_pts)]
+
+                pulse_nodes.append(
+                    {
+                        "idx": i,
+                        "changed": changed_idx,
+                        "sizes": base_sizes,
+                        "lws": base_lws,
+                    }
+                )
+
+        if not pulse_lines and not pulse_nodes:
+            return None
+
+        line_json = json.dumps(pulse_lines, ensure_ascii=False).replace("</", "<\\/")
+        node_json = json.dumps(pulse_nodes, ensure_ascii=False).replace("</", "<\\/")
+        js_anim_lines = [
+            f"const pulseLines = {line_json};",
+            f"const pulseNodes = {node_json};",
+            "const pulseMaxMs = 14000.0;",
+            "const t0 = performance.now();",
+            "let lastTs = 0.0;",
+            "function tickPulse(ts){",
+            "  if (!gd.isConnected) return;",
+            "  const elapsed = ts - t0;",
+            "  if (elapsed > pulseMaxMs){",
+            "    if (pulseLines.length){",
+            "      const idxsL = pulseLines.map(it => it.idx);",
+            "      const widths0 = pulseLines.map(it => Number(it.base || 4));",
+            "      const opL0 = pulseLines.map(it => Number(it.op || 1.0));",
+            "      PlotlyApi.restyle(gd, {'line.width': widths0, 'opacity': opL0}, idxsL);",
+            "    }",
+            "    if (pulseNodes.length){",
+            "      for (const it of pulseNodes){",
+            "        PlotlyApi.restyle(gd, {'marker.size': [it.sizes], 'marker.line.width': [it.lws]}, [it.idx]);",
+            "      }",
+            "    }",
+            "    return;",
+            "  }",
+            "  if (document.hidden || (ts - lastTs) < 66.0){ requestAnimationFrame(tickPulse); return; }",
+            "  lastTs = ts;",
+            "  const phase = elapsed / 1000.0;",
+            "  const wave = 0.5 + 0.5 * Math.sin(phase * 2.0 * Math.PI * 0.9);",
+            "  if (pulseLines.length){",
+            "    const idxsL = pulseLines.map(it => it.idx);",
+            "    const widths = pulseLines.map(it => Number(it.base || 4) * (0.75 + 0.95 * wave));",
+            "    const opL = pulseLines.map(it => Math.min(1.0, Number(it.op || 1.0) * (0.68 + 0.32 * wave)));",
+            "    PlotlyApi.restyle(gd, {'line.width': widths, 'opacity': opL}, idxsL);",
+            "  }",
+            "  if (pulseNodes.length){",
+            "    const sMul = (0.82 + 0.42 * wave);",
+            "    const wMul = (0.65 + 1.15 * wave);",
+            "    for (const it of pulseNodes){",
+            "      const changedSet = new Set((it.changed || []).map(x => Number(x)));",
+            "      const sizes = (it.sizes || []).map((v, j) => changedSet.has(j) ? Number(v || 12) * sMul : Number(v || 12));",
+            "      const lws = (it.lws || []).map((v, j) => changedSet.has(j) ? Number(v || 1) * wMul : Number(v || 1));",
+            "      PlotlyApi.restyle(gd, {'marker.size': [sizes], 'marker.line.width': [lws]}, [it.idx]);",
+            "    }",
+            "  }",
+            "  requestAnimationFrame(tickPulse);",
+            "}",
+            "requestAnimationFrame(tickPulse);",
+        ]
+    elif pt == "violation_overview":
+        node_trace_idx = None
+        line_targets: list[dict[str, Any]] = []
+        for i, tr in enumerate(data):
+            if not isinstance(tr, dict):
+                continue
+            tr_type = str(tr.get("type", "")).lower()
+            mode = str(tr.get("mode", "")).lower()
+            if tr_type == "scatter" and "lines" in mode:
+                line_cfg = dict(tr.get("line") or {})
+                line_color = str(line_cfg.get("color", "")).lower()
+                if "#d62728" in line_color or "214,39,40" in line_color:
+                    try:
+                        base_w = float(line_cfg.get("width", 5.0))
+                    except Exception:
+                        base_w = 5.0
+                    try:
+                        base_op = float(tr.get("opacity", 1.0))
+                    except Exception:
+                        base_op = 1.0
+                    line_targets.append(
+                        {
+                            "idx": i,
+                            "base": max(1.0, base_w),
+                            "op": max(0.2, min(1.0, base_op)),
+                        }
+                    )
+            if node_trace_idx is None and tr_type == "scatter" and "markers" in mode:
+                name = str(tr.get("name", "")).lower()
+                if ("violation" in name) or ("越限" in name):
+                    node_trace_idx = i
+
+        if node_trace_idx is None:
+            return None
+
+        node_trace = data[node_trace_idx]
+        x_vals = list(node_trace.get("x") or [])
+        y_vals = list(node_trace.get("y") or [])
+        marker = dict(node_trace.get("marker") or {})
+        colors = marker.get("color")
+        if not isinstance(colors, list):
+            return None
+
+        vio_idx: list[int] = []
+        for i, c in enumerate(colors):
+            s = str(c).lower()
+            if "#d62728" in s or "214,39,40" in s:
+                vio_idx.append(i)
+        if not vio_idx:
+            return None
+
+        size_raw = marker.get("size")
+        if isinstance(size_raw, list):
+            halo_base_sizes = [max(14.0, float(size_raw[i]) + 12.0) for i in vio_idx if i < len(size_raw)]
+        else:
+            try:
+                s0 = float(size_raw)
+            except Exception:
+                s0 = 16.0
+            halo_base_sizes = [max(14.0, s0 + 12.0) for _ in vio_idx]
+
+        halo_x = [x_vals[i] for i in vio_idx if i < len(x_vals)]
+        halo_y = [y_vals[i] for i in vio_idx if i < len(y_vals)]
+        if not halo_x or not halo_y:
+            return None
+
+        halo_trace = {
+            "type": "scatter",
+            "x": halo_x,
+            "y": halo_y,
+            "mode": "markers",
+            "name": "_vio_overview_halo",
+            "hoverinfo": "skip",
+            "showlegend": False,
+            "marker": {
+                "size": halo_base_sizes,
+                "color": "rgba(214,39,40,0.16)",
+                "line": {"width": 0},
+                "symbol": "circle",
+            },
+        }
+        halo_idx = len(data)
+        data.append(halo_trace)
+
+        base_sizes_json = json.dumps(halo_base_sizes, ensure_ascii=False).replace("</", "<\\/")
+        line_targets_json = json.dumps(line_targets, ensure_ascii=False).replace("</", "<\\/")
+        js_anim_lines = [
+            f"const haloIdx = {halo_idx};",
+            f"const haloBase = {base_sizes_json};",
+            f"const lineTargets = {line_targets_json};",
+            "const t0 = performance.now();",
+            "const pulseMaxMs = 14000.0;",
+            "let lastTs = 0.0;",
+            "function pulse(ts){",
+            "  if (!gd.isConnected) return;",
+            "  if ((ts - t0) > pulseMaxMs){",
+            "    PlotlyApi.restyle(gd, {'marker.size': [haloBase], 'marker.color': 'rgba(214,39,40,0.16)'}, [haloIdx]);",
+            "    if (lineTargets.length){",
+            "      const idxs0 = lineTargets.map(it => it.idx);",
+            "      const widths0 = lineTargets.map(it => Number(it.base || 4));",
+            "      const op0 = lineTargets.map(it => Number(it.op || 1.0));",
+            "      PlotlyApi.restyle(gd, {'line.width': widths0, 'opacity': op0}, idxs0);",
+            "    }",
+            "    return;",
+            "  }",
+            "  if (document.hidden || (ts - lastTs) < 66.0){ requestAnimationFrame(pulse); return; }",
+            "  lastTs = ts;",
+            "  const phase = (ts - t0) / 1000.0;",
+            "  const wave = 0.5 + 0.5 * Math.sin(phase * 2.0 * Math.PI * 0.9);",
+            "  const sizes = haloBase.map(v => Math.max(8.0, Number(v || 0) * (1.0 + 0.12 * wave)));",
+            "  const alpha = 0.10 + 0.12 * wave;",
+            "  PlotlyApi.restyle(",
+            "    gd,",
+            "    {'marker.size': [sizes], 'marker.color': `rgba(214,39,40,${alpha.toFixed(3)})`},",
+            "    [haloIdx]",
+            "  );",
+            "  if (lineTargets.length){",
+            "    const idxs = lineTargets.map(it => it.idx);",
+            "    const widths = lineTargets.map(it => Number(it.base || 4) * (0.94 + 0.18 * wave));",
+            "    const opac = lineTargets.map(it => Math.min(1.0, Number(it.op || 1.0) * (0.84 + 0.16 * wave)));",
+            "    PlotlyApi.restyle(gd, {'line.width': widths, 'opacity': opac}, idxs);",
+            "  }",
+            "  requestAnimationFrame(pulse);",
+            "}",
+            "requestAnimationFrame(pulse);",
+        ]
+
+    elif pt == "voltage_heatmap":
+        bus_trace_idx = None
+        for i, tr in enumerate(data):
+            if isinstance(tr, dict) and str(tr.get("name", "")) == "bus":
+                bus_trace_idx = i
+                break
+        if bus_trace_idx is None:
+            return None
+
+        bus_trace = data[bus_trace_idx]
+        x_vals = list(bus_trace.get("x") or [])
+        y_vals = list(bus_trace.get("y") or [])
+        marker = dict(bus_trace.get("marker") or {})
+        marker_line = dict(marker.get("line") or {})
+        widths = marker_line.get("width")
+        if not isinstance(widths, list):
+            return None
+
+        size_raw = marker.get("size")
+        vio_idx: list[int] = []
+        for i, w in enumerate(widths):
+            try:
+                if float(w) > 1.5:
+                    vio_idx.append(i)
+            except Exception:
+                continue
+        if not vio_idx:
+            return None
+
+        halo_x = [x_vals[i] for i in vio_idx if i < len(x_vals)]
+        halo_y = [y_vals[i] for i in vio_idx if i < len(y_vals)]
+        if not halo_x or not halo_y:
+            return None
+
+        if isinstance(size_raw, list):
+            halo_base_sizes = [max(14.0, float(size_raw[i]) + 12.0) for i in vio_idx if i < len(size_raw)]
+        else:
+            try:
+                s = float(size_raw)
+            except Exception:
+                s = 14.0
+            halo_base_sizes = [max(14.0, s + 12.0) for _ in halo_x]
+
+        halo_trace = {
+            "type": "scatter",
+            "x": halo_x,
+            "y": halo_y,
+            "mode": "markers",
+            "name": "_vio_halo",
+            "hoverinfo": "skip",
+            "showlegend": False,
+            "marker": {
+                "size": halo_base_sizes,
+                "color": "rgba(214,39,40,0.18)",
+                "line": {"width": 0},
+                "symbol": "circle",
+            },
+        }
+        halo_idx = len(data)
+        data.append(halo_trace)
+
+        base_sizes_json = json.dumps(halo_base_sizes, ensure_ascii=False).replace("</", "<\\/")
+        js_anim_lines = [
+            f"const haloIdx = {halo_idx};",
+            f"const haloBase = {base_sizes_json};",
+            "const t0 = performance.now();",
+            "const pulseMaxMs = 14000.0;",
+            "let lastTs = 0.0;",
+            "function pulse(ts){",
+            "  if (!gd.isConnected) return;",
+            "  if ((ts - t0) > pulseMaxMs){",
+            "    PlotlyApi.restyle(gd, {'marker.size': [haloBase], 'marker.color': 'rgba(214,39,40,0.18)'}, [haloIdx]);",
+            "    return;",
+            "  }",
+            "  if (document.hidden || (ts - lastTs) < 66.0){ requestAnimationFrame(pulse); return; }",
+            "  lastTs = ts;",
+            "  const phase = (ts - t0) / 1000.0;",
+            "  const s = 1.0 + 0.11 * Math.sin(phase * 2.0 * Math.PI * 0.9);",
+            "  const a = 0.10 + 0.12 * (0.5 + 0.5 * Math.sin(phase * 2.0 * Math.PI * 0.9));",
+            "  const sizes = haloBase.map(v => Math.max(8.0, Number(v || 0) * s));",
+            "  PlotlyApi.restyle(",
+            "    gd,",
+            "    {'marker.size': [sizes], 'marker.color': `rgba(214,39,40,${a.toFixed(3)})`},",
+            "    [haloIdx]",
+            "  );",
+            "  requestAnimationFrame(pulse);",
+            "}",
+            "requestAnimationFrame(pulse);",
+        ]
+
+    fig_dict["data"] = data
+    if pt in {"voltage_heatmap", "comparison_panel"}:
+        layout["showlegend"] = True
+    fig_dict["layout"] = layout
+    fig_json_embedded = json.dumps(fig_dict, ensure_ascii=False).replace("</", "<\\/")
+    div_id = f"plotly_anim_{uuid.uuid4().hex}"
+    if pt == "violation_overview":
+        height = int(layout.get("height", 640) or 640) + 20
+        height = max(520, min(height, 860))
+    elif pt == "comparison_panel":
+        height = int(layout.get("height", 680) or 680) + 20
+        height = max(520, min(height, 920))
+    else:
+        height = int(layout.get("height", 700) or 700) + 56
+        height = max(560, min(height, 980))
+    js_anim_code = "\n".join(js_anim_lines)
+
+    html = f"""
+<div id="{div_id}" style="width:100%;height:{height}px;"></div>
+<script>
+(function() {{
+  const fig = {fig_json_embedded};
+  const gd = document.getElementById("{div_id}");
+  if (!gd) return;
+
+  function initPlot(P) {{
+    if (!P) return;
+    const PlotlyApi = P;
+    const layout = Object.assign({{}}, fig.layout || {{}});
+    layout.autosize = true;
+    if (Object.prototype.hasOwnProperty.call(layout, "width")) delete layout.width;
+    PlotlyApi.newPlot(gd, fig.data || [], layout, {{
+      displaylogo: false,
+      responsive: true
+    }}).then(function() {{
+      const resizePlot = function() {{
+        try {{ PlotlyApi.Plots.resize(gd); }} catch (_err) {{}}
+      }};
+      requestAnimationFrame(resizePlot);
+      setTimeout(resizePlot, 80);
+      setTimeout(resizePlot, 240);
+      setTimeout(resizePlot, 600);
+      if (window.ResizeObserver) {{
+        const ro = new ResizeObserver(function() {{ resizePlot(); }});
+        ro.observe(gd);
+        if (gd.parentElement) ro.observe(gd.parentElement);
+      }}
+      {js_anim_code}
+    }});
+  }}
+
+  if (window.Plotly) {{
+    initPlot(window.Plotly);
+    return;
+  }}
+  const s = document.createElement("script");
+  s.src = "https://cdn.plot.ly/plotly-2.35.2.min.js";
+  s.onload = function() {{ initPlot(window.Plotly); }};
+  document.head.appendChild(s);
+}})();
+</script>
+"""
+    return html, height
+
+
 def _build_flow_plot_artifacts(
     *,
     positions: Optional[Dict[int, tuple[float, float]]] = None,
@@ -976,6 +1496,8 @@ def _append_ui_message(
     remedial_plan: Optional[Dict[str, Any]] = None,
     extra_plots: Optional[list[Dict[str, Any]]] = None,
     result: Optional[Dict[str, Any]] = None,
+    report_md: Optional[str] = None,
+    report_filename: Optional[str] = None,
 ) -> None:
     msg: Dict[str, Any] = {"role": role, "content": content}
     if plot_json:
@@ -992,6 +1514,9 @@ def _append_ui_message(
         msg["result"] = result
     if extra_plots:
         msg["extra_plots"] = extra_plots
+    if report_md:
+        msg["report_md"] = report_md
+        msg["report_filename"] = report_filename or "report.md"
     # Attach latest result details to assistant messages for richer UI rendering.
     if role == "assistant" and st.session_state.session.last_result is not None:
         msg["result"] = st.session_state.session.last_result.model_dump()
@@ -1009,7 +1534,8 @@ def _split_comparison_figure(fig: go.Figure, T: Dict[str, str]) -> list[go.Figur
         ("x", "y", "Before" if T is EN else "修改前"),
         ("x2", "y2", "After" if T is EN else "修改后"),
     ]
-    for xkey, ykey, title in panel_specs:
+    for panel_idx, (xkey, ykey, title) in enumerate(panel_specs):
+        is_after_panel = panel_idx == 1
         f = go.Figure()
         for tr in fig.data:
             if str(getattr(tr, "type", "") or "") == "table":
@@ -1038,12 +1564,77 @@ def _split_comparison_figure(fig: go.Figure, T: Dict[str, str]) -> list[go.Figur
         f.update_layout(
             title=title,
             template=fig.layout.template,
+            showlegend=is_after_panel,
             height=680,
-            margin=dict(l=10, r=10, t=56, b=10),
+            margin=dict(l=10, r=10, t=(98 if is_after_panel else 56), b=10),
             annotations=panel_annotations,
         )
-        f.update_xaxes(showgrid=False, zeroline=False, visible=False)
-        f.update_yaxes(showgrid=False, zeroline=False, visible=False)
+        xaxis_name = "xaxis" if xkey == "x" else f"xaxis{xkey[1:]}"
+        yaxis_name = "yaxis" if ykey == "y" else f"yaxis{ykey[1:]}"
+        src_xaxis = getattr(fig.layout, xaxis_name, None)
+        src_yaxis = getattr(fig.layout, yaxis_name, None)
+        x_range = list(getattr(src_xaxis, "range", []) or [])
+        y_range = list(getattr(src_yaxis, "range", []) or [])
+        x_kwargs: Dict[str, Any] = dict(showgrid=False, zeroline=False, visible=False)
+        y_kwargs: Dict[str, Any] = dict(showgrid=False, zeroline=False, visible=False, scaleanchor="x")
+        if len(x_range) == 2:
+            x_kwargs["range"] = x_range
+        if len(y_range) == 2:
+            y_kwargs["range"] = y_range
+        f.update_xaxes(**x_kwargs)
+        f.update_yaxes(**y_kwargs)
+
+        if is_after_panel:
+            f.add_trace(
+                go.Scatter(
+                    x=[None],
+                    y=[None],
+                    mode="lines",
+                    line=dict(color="rgba(160,160,160,0.45)", width=1.8),
+                    name=("Network context" if T is EN else "网络背景"),
+                    hoverinfo="skip",
+                    showlegend=True,
+                )
+            )
+            f.add_trace(
+                go.Scatter(
+                    x=[None],
+                    y=[None],
+                    mode="lines",
+                    line=dict(color="#d62728", width=4, dash="dash"),
+                    name=("Changed branch" if T is EN else "变化支路"),
+                    hoverinfo="skip",
+                    showlegend=True,
+                )
+            )
+            f.add_trace(
+                go.Scatter(
+                    x=[None],
+                    y=[None],
+                    mode="markers",
+                    marker=dict(
+                        size=10,
+                        color="rgba(255,255,255,0)",
+                        symbol="circle",
+                        line=dict(color="#d62728", width=2),
+                    ),
+                    name=("Changed bus" if T is EN else "变化母线"),
+                    hoverinfo="skip",
+                    showlegend=True,
+                )
+            )
+            f.update_layout(
+                showlegend=True,
+                legend=dict(
+                    orientation="h",
+                    yanchor="top",
+                    y=0.995,
+                    xanchor="left",
+                    x=0.01,
+                    font=dict(size=11, family="Source Sans 3, sans-serif", color="#334155"),
+                    bgcolor="rgba(255,255,255,0.88)",
+                )
+            )
         out.append(f)
 
     table_traces = [tr for tr in fig.data if str(getattr(tr, "type", "") or "") == "table"]
@@ -1067,6 +1658,214 @@ def _split_comparison_figure(fig: go.Figure, T: Dict[str, str]) -> list[go.Figur
     return out
 
 
+def _render_animated_stat_card(
+    *,
+    label: str,
+    value: float,
+    unit: str = "",
+    decimals: int = 2,
+    accent: str = "#111827",
+    height: int = 118,
+) -> None:
+    card_id = f"pf_stat_{uuid.uuid4().hex}"
+    unit_html = f"<span class='pf-unit'> {escape(unit)}</span>" if unit else ""
+    html = f"""
+<div id="{card_id}" class="pf-stat-card">
+  <div class="pf-label">{escape(label)}</div>
+  <div class="pf-value"><span class="pf-num">0</span>{unit_html}</div>
+</div>
+<style>
+#{card_id}.pf-stat-card {{
+  border-radius: 12px;
+  background: #ffffff;
+  border: 1px solid rgba(226,232,240,0.95);
+  box-shadow: 0 1px 3px rgba(0,0,0,0.08);
+  padding: 10px 10px 8px;
+  text-align: center;
+  animation: pfStatIn 340ms cubic-bezier(0.2,0.8,0.2,1);
+}}
+#{card_id} .pf-label {{
+  font-family: "Source Sans 3", sans-serif;
+  font-size: 12px;
+  color: #64748b;
+  line-height: 1.2;
+}}
+#{card_id} .pf-value {{
+  margin-top: 8px;
+  font-family: "Source Sans 3", sans-serif;
+  font-size: 30px;
+  font-weight: 700;
+  color: {accent};
+  line-height: 1.1;
+  letter-spacing: 0.2px;
+}}
+#{card_id} .pf-unit {{
+  font-size: 16px;
+  font-weight: 600;
+  color: #64748b;
+}}
+@keyframes pfStatIn {{
+  from {{ opacity: 0; transform: translateY(5px); }}
+  to {{ opacity: 1; transform: translateY(0); }}
+}}
+</style>
+<script>
+(function(){{
+  const root = document.getElementById("{card_id}");
+  if (!root) return;
+  const el = root.querySelector(".pf-num");
+  if (!el) return;
+  const target = Number({float(value)});
+  const dec = Number({int(decimals)});
+  const dur = 860.0;
+  const t0 = performance.now();
+  function fmt(v){{
+    try {{
+      return Number(v).toLocaleString(undefined, {{
+        minimumFractionDigits: dec,
+        maximumFractionDigits: dec
+      }});
+    }} catch (e) {{
+      return Number(v).toFixed(dec);
+    }}
+  }}
+  function easeOutCubic(x) {{ return 1.0 - Math.pow(1.0 - x, 3.0); }}
+  function tick(ts) {{
+    const p = Math.min(1.0, (ts - t0) / dur);
+    const k = easeOutCubic(p);
+    el.textContent = fmt(target * k);
+    if (p < 1.0) requestAnimationFrame(tick);
+  }}
+  requestAnimationFrame(tick);
+}})();
+</script>
+"""
+    components.html(html, height=height, scrolling=False)
+
+
+def _render_animated_transition_card(
+    *,
+    label: str,
+    before: float,
+    after: float,
+    delta: float,
+    color: str,
+    unit: str = "",
+    decimals: int = 0,
+    height: int = 136,
+) -> None:
+    card_id = f"pf_transition_{uuid.uuid4().hex}"
+    if delta < 0:
+        delta_prefix = "&#8595;"  # down arrow
+    elif delta > 0:
+        delta_prefix = "&#8593;"  # up arrow
+    else:
+        delta_prefix = ""
+    unit_str = f" {unit}" if unit else ""
+    delta_num = f"{abs(delta):.{decimals}f}"
+    delta_html = f"({delta_prefix}{delta_num})" if delta_prefix else f"({delta_num})"
+    html = f"""
+<div id="{card_id}" class="pf-cmp-card">
+  <div class="pf-cmp-label">{escape(label)}</div>
+  <div class="pf-cmp-main">
+    <span class="pf-before"></span>
+    <span class="pf-arrow">&#8594;</span>
+    <span class="pf-after"></span>
+    <span class="pf-unit">{escape(unit_str)}</span>
+  </div>
+  <div class="pf-cmp-delta">{delta_html}</div>
+</div>
+<style>
+#{card_id}.pf-cmp-card {{
+  min-height: 104px;
+  display:flex;
+  flex-direction:column;
+  justify-content:center;
+  text-align:center;
+  padding: 10px 8px;
+  border-radius: 8px;
+  border: 1.2px solid #dbe4ef;
+  background: linear-gradient(180deg, #ffffff 0%, #f8fafc 100%);
+  box-shadow:0 2px 7px rgba(15,23,42,0.10);
+  animation: pfCmpIn 320ms cubic-bezier(0.2,0.8,0.2,1);
+}}
+#{card_id} .pf-cmp-label {{
+  font-family: "Source Sans 3", sans-serif;
+  font-size:12px;
+  color:#718096;
+  line-height:1.2;
+  background:#eef2f7;
+  border:1px solid #dbe4ef;
+  border-radius:999px;
+  padding:2px 10px;
+  display:inline-block;
+  margin:0 auto;
+}}
+#{card_id} .pf-cmp-main {{
+  margin-top: 4px;
+  font-family: "Source Sans 3", sans-serif;
+  font-size:17px;
+  font-weight:600;
+  line-height:1.15;
+  color:{color};
+}}
+#{card_id} .pf-cmp-delta {{
+  margin-top: 2px;
+  font-family: "Source Sans 3", sans-serif;
+  font-size:13px;
+  font-weight:600;
+  color:{color};
+}}
+#{card_id} .pf-arrow {{
+  margin: 0 4px;
+}}
+#{card_id} .pf-unit {{
+  color:#718096;
+  font-weight:600;
+  margin-left:2px;
+}}
+@keyframes pfCmpIn {{
+  from {{ opacity: 0; transform: translateY(4px); }}
+  to {{ opacity: 1; transform: translateY(0); }}
+}}
+</style>
+<script>
+(function(){{
+  const root = document.getElementById("{card_id}");
+  if (!root) return;
+  const beforeEl = root.querySelector(".pf-before");
+  const afterEl = root.querySelector(".pf-after");
+  if (!beforeEl || !afterEl) return;
+  const startV = Number({float(before)});
+  const endV = Number({float(after)});
+  const dec = Number({int(decimals)});
+  const dur = 780.0;
+  const t0 = performance.now();
+  function fmt(v){{
+    try {{
+      return Number(v).toLocaleString(undefined, {{
+        minimumFractionDigits: dec,
+        maximumFractionDigits: dec
+      }});
+    }} catch (e) {{
+      return Number(v).toFixed(dec);
+    }}
+  }}
+  beforeEl.textContent = fmt(startV);
+  function easeOutCubic(x) {{ return 1.0 - Math.pow(1.0 - x, 3.0); }}
+  function tick(ts) {{
+    const p = Math.min(1.0, (ts - t0) / dur);
+    const k = easeOutCubic(p);
+    afterEl.textContent = fmt(startV + (endV - startV) * k);
+    if (p < 1.0) requestAnimationFrame(tick);
+  }}
+  requestAnimationFrame(tick);
+}})();
+</script>
+"""
+    components.html(html, height=height, scrolling=False)
+
+
 def _render_qc_summary_row(
     ep: Dict[str, Any], mi: int, epi: int, T: Dict[str, str]
 ) -> None:
@@ -1086,23 +1885,50 @@ def _render_qc_summary_row(
     cols = st.columns(len(summaries))
     for ci, (col, s) in enumerate(zip(cols, summaries)):
         label = s["label_zh"] if lang == "zh" else s["label_en"]
-        text = s["fmt"](s["before"], s["after"], s["delta"])
         if s["improved"]:
             color = "#38A169"
         elif s["worsened"]:
             color = "#E53E3E"
         else:
             color = "#718096"
-        col.markdown(
-            f"<div style='text-align:center; padding:8px 4px; border-radius:8px; "
-            f"background:#fff; box-shadow:0 1px 2px rgba(0,0,0,0.06);'>"
-            f"<span style='font-family:Source Sans 3,sans-serif; font-size:12px; "
-            f"color:#718096;'>{label}</span><br>"
-            f"<span style='font-family:Source Sans 3,sans-serif; font-size:15px; "
-            f"font-weight:600; color:{color};'>{text}</span>"
-            f"</div>",
-            unsafe_allow_html=True,
-        )
+
+        before_v = s.get("before")
+        after_v = s.get("after")
+        delta_v = s.get("delta")
+        unit = "MW" if str(s.get("label_en", "")).strip().lower() == "total loss" else ""
+        decimals = 1 if unit == "MW" else 0
+        try:
+            before_f = float(before_v)
+            after_f = float(after_v)
+            delta_f = float(delta_v)
+            is_numeric = True
+        except Exception:
+            is_numeric = False
+
+        with col:
+            if is_numeric:
+                with st.container(border=True):
+                    _render_animated_transition_card(
+                        label=label,
+                        before=before_f,
+                        after=after_f,
+                        delta=delta_f,
+                        color=color,
+                        unit=unit,
+                        decimals=decimals,
+                    )
+            else:
+                text = s["fmt"](s["before"], s["after"], s["delta"])
+                st.markdown(
+                    f"<div style='text-align:center; padding:8px 4px; border-radius:8px; "
+                    f"background:#fff; box-shadow:0 1px 2px rgba(0,0,0,0.06);'>"
+                    f"<span style='font-family:Source Sans 3,sans-serif; font-size:12px; "
+                    f"color:#718096;'>{label}</span><br>"
+                    f"<span style='font-family:Source Sans 3,sans-serif; font-size:15px; "
+                    f"font-weight:600; color:{color};'>{text}</span>"
+                    f"</div>",
+                    unsafe_allow_html=True,
+                )
 
 
 def _render_benchmark_cards(ep: Dict[str, Any], mi: int, epi: int, T: Dict[str, str]) -> None:
@@ -1172,7 +1998,7 @@ def _render_result_details(result_dict: Dict[str, Any], T: Dict[str, str]) -> No
     backend = str(result_dict.get("solver_backend") or st.session_state.get("solver_backend", "pandapower"))
     st.info(f"{T['backend_active']}: `{backend}`")
 
-    with st.expander("Key metrics", expanded=False):
+    with st.expander("Key metrics" if T is EN else "关键指标", expanded=False):
         st.write(
             {
                 "case": result_dict.get("case_name"),
@@ -1198,9 +2024,9 @@ def _render_result_details(result_dict: Dict[str, Any], T: Dict[str, str]) -> No
             with st.expander(T["llm_raw_expander"], expanded=False):
                 st.markdown(f"**{T['llm_prompt']}**")
                 prompt_text = str(prompt or "")
-                st.caption(f"{len(prompt_text):,} chars")
+                st.caption(f"{len(prompt_text):,} {'chars' if T is EN else '字符'}")
                 st.download_button(
-                    "Download Prompt",
+                    "Download Prompt" if T is EN else "下载 Prompt",
                     data=prompt_text,
                     file_name=f"{result_dict.get('case_name','case')}_llm_prompt.txt",
                     mime="text/plain",
@@ -1215,9 +2041,9 @@ def _render_result_details(result_dict: Dict[str, Any], T: Dict[str, str]) -> No
                 )
                 st.markdown(f"**{T['llm_response']}**")
                 response_text = str(response or "")
-                st.caption(f"{len(response_text):,} chars")
+                st.caption(f"{len(response_text):,} {'chars' if T is EN else '字符'}")
                 st.download_button(
-                    "Download Response",
+                    "Download Response" if T is EN else "下载 Response",
                     data=response_text,
                     file_name=f"{result_dict.get('case_name','case')}_llm_response.json",
                     mime="application/json",
@@ -1253,14 +2079,178 @@ def _render_bottom_stats(T: Dict[str, str]) -> None:
     max_loading = max((float(l.loading_percent) for l in result.line_flows), default=0.0)
     c1, c2, c3, c4 = st.columns(4)
     with c1:
-        st.metric("Total Generation" if T is EN else "总发电量", f"{result.total_generation_mw:.2f} MW")
+        _render_animated_stat_card(
+            label=("Total Generation" if T is EN else "总发电量"),
+            value=float(result.total_generation_mw),
+            unit="MW",
+            decimals=2,
+            accent="#0f172a",
+        )
     with c2:
-        st.metric("Total Load" if T is EN else "总负荷", f"{result.total_load_mw:.2f} MW")
+        _render_animated_stat_card(
+            label=("Total Load" if T is EN else "总负荷"),
+            value=float(result.total_load_mw),
+            unit="MW",
+            decimals=2,
+            accent="#0f172a",
+        )
     with c3:
-        st.metric("System Losses" if T is EN else "总损耗", f"{result.total_loss_mw:.2f} MW")
+        _render_animated_stat_card(
+            label=("System Losses" if T is EN else "总损耗"),
+            value=float(result.total_loss_mw),
+            unit="MW",
+            decimals=2,
+            accent=("#E53E3E" if float(result.total_loss_mw) > 0 else "#0f172a"),
+        )
     with c4:
-        st.metric("Max Branch Loading" if T is EN else "最大支路负载率", f"{max_loading:.1f}%")
+        _render_animated_stat_card(
+            label=("Max Branch Loading" if T is EN else "最大支路负载率"),
+            value=float(max_loading),
+            unit="%",
+            decimals=1,
+            accent=("#E53E3E" if max_loading >= 100.0 else "#0f172a"),
+        )
 
+
+def _generate_report_markdown(T: Dict[str, str]) -> Optional[str]:
+    """Generate a Markdown analysis report from current session state."""
+    session: SessionState = st.session_state.session
+    result = session.last_result
+    if result is None:
+        return None
+
+    zh = T is ZH
+    lines: list[str] = []
+
+    # Title
+    title = f"电力系统潮流分析报告 — {result.case_name}" if zh else f"Power Flow Analysis Report — {result.case_name}"
+    lines.append(f"# {title}")
+    lines.append("")
+
+    # System info
+    info = session.network_info
+    if info:
+        lines.append(f"## {'系统概览' if zh else 'System Overview'}")
+        lines.append("")
+        lines.append(f"| {'项目' if zh else 'Item'} | {'值' if zh else 'Value'} |")
+        lines.append("|---|---|")
+        lines.append(f"| {'节点数' if zh else 'Buses'} | {info.n_buses} |")
+        lines.append(f"| {'发电机数' if zh else 'Generators'} | {info.n_generators} |")
+        lines.append(f"| {'线路数' if zh else 'Lines'} | {info.n_lines} |")
+        lines.append(f"| {'负荷数' if zh else 'Loads'} | {info.n_loads} |")
+        lines.append(f"| {'总负荷' if zh else 'Total Load'} | {info.total_load_mw:.2f} MW |")
+        lines.append(f"| {'总发电容量' if zh else 'Gen Capacity'} | {info.total_gen_capacity_mw:.2f} MW |")
+        lines.append("")
+
+    # Power flow summary
+    lines.append(f"## {'潮流计算结果' if zh else 'Power Flow Results'}")
+    lines.append("")
+    status = ("收敛" if result.converged else "未收敛") if zh else ("Converged" if result.converged else "Not Converged")
+    lines.append(f"- **{'状态' if zh else 'Status'}**: {status}")
+    lines.append(f"- **{'总发电量' if zh else 'Total Generation'}**: {result.total_generation_mw:.2f} MW")
+    lines.append(f"- **{'总负荷' if zh else 'Total Load'}**: {result.total_load_mw:.2f} MW")
+    lines.append(f"- **{'系统损耗' if zh else 'System Losses'}**: {result.total_loss_mw:.2f} MW")
+    if result.line_flows:
+        max_loading = max(float(lf.loading_percent) for lf in result.line_flows)
+        lines.append(f"- **{'最大支路负载率' if zh else 'Max Branch Loading'}**: {max_loading:.1f}%")
+    lines.append("")
+
+    # Bus voltages table
+    if result.bus_voltages:
+        lines.append(f"### {'节点电压' if zh else 'Bus Voltages'}")
+        lines.append("")
+        lines.append(f"| {'节点' if zh else 'Bus'} | V (p.u.) | {'角度' if zh else 'Angle'} (°) | {'越限' if zh else 'Violation'} |")
+        lines.append("|---|---|---|---|")
+        for bv in sorted(result.bus_voltages, key=lambda b: b.bus_id):
+            viol = ""
+            if bv.is_violation and bv.violation_type:
+                viol = bv.violation_type.value
+            lines.append(f"| {bv.bus_id} | {bv.vm_pu:.4f} | {bv.va_deg:.2f} | {viol} |")
+        lines.append("")
+
+    # Line flows table
+    if result.line_flows:
+        lines.append(f"### {'支路潮流' if zh else 'Branch Flows'}")
+        lines.append("")
+        lines.append(f"| {'线路' if zh else 'Line'} | {'从' if zh else 'From'} | {'到' if zh else 'To'} | P (MW) | Q (Mvar) | {'负载率' if zh else 'Loading'} (%) |")
+        lines.append("|---|---|---|---|---|---|")
+        for lf in sorted(result.line_flows, key=lambda l: l.line_id):
+            lines.append(f"| {lf.line_id} | {lf.from_bus} | {lf.to_bus} | {lf.p_from_mw:.2f} | {lf.q_from_mvar:.2f} | {lf.loading_percent:.1f} |")
+        lines.append("")
+
+    # Violations
+    if result.voltage_violations or result.thermal_violations:
+        lines.append(f"## {'越限汇总' if zh else 'Violations Summary'}")
+        lines.append("")
+        if result.voltage_violations:
+            lines.append(f"### {'电压越限' if zh else 'Voltage Violations'} ({len(result.voltage_violations)})")
+            lines.append("")
+            for bv in result.voltage_violations:
+                vtype = bv.violation_type.value if bv.violation_type else "unknown"
+                lines.append(f"- Bus {bv.bus_id}: V = {bv.vm_pu:.4f} p.u. ({vtype})")
+            lines.append("")
+        if result.thermal_violations:
+            lines.append(f"### {'热稳定越限' if zh else 'Thermal Violations'} ({len(result.thermal_violations)})")
+            lines.append("")
+            for lf in result.thermal_violations:
+                lines.append(f"- Line {lf.line_id} ({lf.from_bus}→{lf.to_bus}): {lf.loading_percent:.1f}%")
+            lines.append("")
+
+    # N-1 report
+    n1 = session.last_n1_report
+    if n1 and n1.results:
+        lines.append(f"## {'N-1 故障分析' if zh else 'N-1 Contingency Analysis'}")
+        lines.append("")
+        lines.append(f"| {'排名' if zh else 'Rank'} | {'支路' if zh else 'Branch'} | {'类型' if zh else 'Type'} | {'得分' if zh else 'Score'} | {'电压越限' if zh else 'V Viol.'} | {'热越限' if zh else 'T Viol.'} |")
+        lines.append("|---|---|---|---|---|---|")
+        for i, o in enumerate(n1.results, 1):
+            lines.append(f"| {i} | {o.from_bus}→{o.to_bus} | {o.branch_type} | {o.score:.2f} | {o.n_voltage_violations} | {o.n_thermal_violations} |")
+        lines.append("")
+
+    # Remedial plan
+    plan = session.last_remedial_plan
+    if plan and plan.actions:
+        lines.append(f"## {'缓解建议' if zh else 'Remedial Actions'}")
+        lines.append("")
+        for i, a in enumerate(plan.actions, 1):
+            lines.append(f"### {i}. {a.description}")
+            lines.append(f"- **{'类型' if zh else 'Type'}**: {a.action}")
+            lines.append(f"- **{'预计风险' if zh else 'Predicted Risk'}**: {a.predicted_risk:.2f}")
+            lines.append(f"- **{'风险降低' if zh else 'Risk Reduction'}**: {a.risk_reduction:.2f}")
+            lines.append("")
+
+    # Modification log
+    if session.modification_log:
+        lines.append(f"## {'修改历史' if zh else 'Modification Log'}")
+        lines.append("")
+        for i, m in enumerate(session.modification_log, 1):
+            lines.append(f"{i}. **{m.action}**: {m.description}")
+        lines.append("")
+
+    lines.append("---")
+    lines.append(f"*{'由 PowerAgent 自动生成' if zh else 'Generated by PowerAgent'} — Kangkai Liang (LKK) @ UCSD*")
+
+    return "\n".join(lines)
+
+
+def _export_report_direct(T: Dict[str, str]) -> None:
+    """Generate and offer a downloadable analysis report."""
+    session: SessionState = st.session_state.session
+    if session.last_result is None:
+        _append_ui_message("assistant", T["need_result"])
+        st.rerun()
+        return
+
+    report_md = _generate_report_markdown(T)
+    if report_md is None:
+        _append_ui_message("assistant", T["need_result"])
+        st.rerun()
+        return
+
+    case_name = session.active_case or "case"
+    msg = ("报告已生成，请点击下方按钮下载。" if T is ZH else "Report generated. Click below to download.")
+    _append_ui_message("assistant", msg, report_md=report_md, report_filename=f"report_{case_name}.md")
+    st.rerun()
 
 
 def _is_all_plots_request(user_text: str) -> bool:
@@ -1359,6 +2349,13 @@ def _plot_all_direct(T: Dict[str, str]) -> None:
         out = safe_json_loads(dispatcher.dispatch("run_powerflow", {}))
         if out.get("error"):
             _append_ui_message("assistant", f"Error: {_format_tool_error(out)}")
+            st.rerun()
+            return
+        if not bool(out.get("converged", False)):
+            summary = str(out.get("summary_text") or "").strip()
+            if not summary:
+                summary = "Power flow did not converge." if T is EN else "潮流计算未收敛。"
+            _append_ui_message("assistant", f"❌ {summary}", result=out)
             st.rerun()
             return
         _push_snapshot(label="run_pf")
@@ -1501,10 +2498,16 @@ def process_user_input(user_text: str, T: Dict[str, str]) -> None:
             if plot_json:
                 plot_type = "flow_diagram"
 
-    # If user asks for report export, append a placeholder notice for now.
+    # If user asks for report export via chat, generate the report inline.
     if "导出" in user_text or "报告" in user_text or "report" in user_text.lower():
-        if "generate_report" not in user_text:
-            assistant_text = (assistant_text + "\n\n" + T["report_todo"]).strip()
+        report_md = _generate_report_markdown(T)
+        if report_md:
+            case_name = session.active_case or "case"
+            extra_plots = (extra_plots or []) + [{
+                "plot_type": "report",
+                "report_md": report_md,
+                "report_filename": f"report_{case_name}.md",
+            }]
 
     render_extra_plots = extra_plots or remedial_extra
     if render_extra_plots:
@@ -1697,6 +2700,7 @@ def _run_n1_direct(T: Dict[str, str], *, top_k: int = 5) -> None:
         "assistant",
         ("🧨 N-1 analysis completed." if T is EN else "🧨 N-1 分析完成。"),
         plot_json=pio.to_json(fig, validate=False),
+        plot_type="n1_ranking",
         n1_report=report.model_dump(),
     )
     st.rerun()
@@ -1823,6 +2827,7 @@ def _run_remedial_direct(T: Dict[str, str], *, max_actions: int = 5) -> None:
         "assistant",
         ("🛠️ Remedial actions generated." if T is EN else "🛠️ 已生成缓解建议。"),
         plot_json=pio.to_json(fig, validate=False),
+        plot_type="remedial_ranking",
         remedial_plan=plan.model_dump(),
         extra_plots=extra_plots,
     )
@@ -2014,6 +3019,39 @@ def main() -> None:
         @import url('https://fonts.googleapis.com/css2?family=Crimson+Pro:wght@400;600;700&family=Source+Sans+3:wght@400;600;700&display=swap');
         :root {
             --primary-color: #facc15;
+            --pf-ease: cubic-bezier(0.2, 0.8, 0.2, 1);
+        }
+        @keyframes pf-page-in {
+            from { opacity: 0; transform: translateY(6px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+        @keyframes pf-card-in {
+            from { opacity: 0; transform: translateY(4px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+        [data-testid="stAppViewContainer"] .main .block-container {
+            animation: pf-page-in 300ms var(--pf-ease);
+        }
+        [data-testid="stChatMessage"],
+        [data-testid="stPlotlyChart"],
+        [data-testid="stMetricValue"] {
+            animation: pf-card-in 260ms var(--pf-ease);
+        }
+        iframe[title*="component"] {
+            animation: none !important;
+            transform: none !important;
+        }
+        .stButton > button {
+            transition: transform 140ms var(--pf-ease), box-shadow 200ms var(--pf-ease), background-color 160ms var(--pf-ease), border-color 160ms var(--pf-ease);
+            will-change: transform;
+        }
+        .stButton > button:hover {
+            transform: translateY(-1px);
+            box-shadow: 0 6px 16px rgba(17,24,39,0.16);
+        }
+        .stButton > button:active {
+            transform: translateY(0);
+            box-shadow: 0 2px 8px rgba(17,24,39,0.14);
         }
         .stButton > button[kind="primary"] {
             background-color: #facc15 !important;
@@ -2031,14 +3069,15 @@ def main() -> None:
     )
     _init_state()
 
-    # Language toggle controls UI; LLM reply language still follows user input.
+    # Language toggle controls both UI labels and assistant reply language requirement.
     with st.sidebar:
-        en = st.toggle("English", value=(st.session_state.ui_lang == "en"))
+        en = st.toggle("English / 英文", value=(st.session_state.ui_lang == "en"))
         st.session_state.ui_lang = "en" if en else "zh"
     T = EN if st.session_state.ui_lang == "en" else ZH
     llm_only_active = str(st.session_state.get("solver_backend", "pandapower")) == "llm_only"
 
     st.title(T["title"])
+    st.caption("Created by Kangkai Liang (LKK) @ UCSD")
 
     # Show pending remedial confirmation dialog first.
     _render_remedial_confirm_dialog(T)
@@ -2098,7 +3137,7 @@ def main() -> None:
         if autoset_case != active_case:
             st.session_state.flow_particles_autoset_case = active_case
 
-        with st.expander("Flow Diagram", expanded=False):
+        with st.expander("Flow Diagram" if T is EN else "潮流分布图设置", expanded=False):
             st.slider(
                 "Heavy threshold (%)" if T is EN else "重载阈值 (%)",
                 min_value=20,
@@ -2163,14 +3202,14 @@ def main() -> None:
                 st.session_state.flow_branch_override_df = None
 
         st.divider()
-        st.markdown("### LLM")
+        st.markdown("### LLM" if T is EN else "### LLM 设置")
         previous_provider = str(st.session_state.get("llm_provider", "openai"))
         provider_options = list(LLM_PROVIDER_LABELS.keys())
         if previous_provider not in provider_options:
             previous_provider = "openai"
         provider_index = provider_options.index(previous_provider)
         selected_provider = st.selectbox(
-            "Provider",
+            "Provider" if T is EN else "服务商",
             provider_options,
             index=provider_index,
             format_func=lambda p: LLM_PROVIDER_LABELS.get(p, p),
@@ -2181,17 +3220,56 @@ def main() -> None:
             if not isinstance(remember, dict):
                 remember = {}
             st.session_state.llm_model = str(remember.get(selected_provider) or _provider_default_model(selected_provider))
-            provider_default_key = _provider_default_key(selected_provider)
-            if provider_default_key:
-                st.session_state.llm_api_key = provider_default_key
+            saved_map = st.session_state.get("_saved_api_key_by_provider", {})
+            if not isinstance(saved_map, dict):
+                saved_map = {}
+            saved_key_for_provider = str(saved_map.get(selected_provider) or "").strip()
+            if saved_key_for_provider:
+                st.session_state.llm_api_key = saved_key_for_provider
+            else:
+                provider_default_key = _provider_default_key(selected_provider)
+                if provider_default_key:
+                    st.session_state.llm_api_key = provider_default_key
 
+        # Restore API key from backup before widget renders
+        if not str(st.session_state.get("llm_api_key", "") or "").strip():
+            saved_map = st.session_state.get("_saved_api_key_by_provider", {})
+            if not isinstance(saved_map, dict):
+                saved_map = {}
+            _saved = str(
+                saved_map.get(selected_provider)
+                or st.session_state.get("_saved_api_key", "")
+                or ""
+            ).strip()
+            if _saved:
+                st.session_state.llm_api_key = _saved
         st.text_input(
-            "API Key",
+            "API Key" if T is EN else "API 密钥",
             type="password",
             key="llm_api_key",
-            placeholder="Enter API key for selected provider",
-            help="OpenAI: sk-... | Gemini: AIza... (or set env var)",
+            placeholder=(
+                "Enter API key for selected provider"
+                if T is EN
+                else "请输入当前服务商对应的 API 密钥"
+            ),
+            help=(
+                "OpenAI: sk-... | Gemini: AIza... (or set env var)"
+                if T is EN
+                else "OpenAI: sk-... | Gemini: AIza...（或通过环境变量配置）"
+            ),
         )
+        # Backup key so it survives widget-key resets across reruns
+        _current_key = str(st.session_state.get("llm_api_key", "") or "").strip()
+        saved_map = st.session_state.get("_saved_api_key_by_provider", {})
+        if not isinstance(saved_map, dict):
+            saved_map = {}
+        if _current_key:
+            saved_map[selected_provider] = _current_key
+            st.session_state["_saved_api_key"] = _current_key  # legacy fallback
+        else:
+            saved_map.pop(selected_provider, None)
+            st.session_state["_saved_api_key"] = ""
+        st.session_state["_saved_api_key_by_provider"] = saved_map
         _persist_insecure_api_key(
             selected_provider,
             str(st.session_state.get("llm_api_key", "") or ""),
@@ -2201,15 +3279,23 @@ def main() -> None:
             api_key_for_list = str(st.session_state.get("llm_api_key", "") or "").strip()
             model_options, model_list_error = _list_gemini_models_dynamic(api_key_for_list)
             if model_list_error:
-                st.caption(f"Model list fallback: {model_list_error}")
+                st.caption(
+                    f"Model list fallback: {model_list_error}"
+                    if T is EN
+                    else f"模型列表回退：{model_list_error}"
+                )
         else:
             model_options = _models_for_provider(selected_provider)
 
         current_model = str(st.session_state.get("llm_model", _provider_default_model(selected_provider)))
         if current_model and current_model not in model_options:
-            # Preserve explicit user choice across reruns/load-case even if
-            # dynamic model listing does not include it at this moment.
-            model_options = [current_model] + [m for m in model_options if m != current_model]
+            if selected_provider == "gemini":
+                # Gemini selector is curated/fixed; drop stale legacy model choices.
+                current_model = model_options[0] if model_options else _provider_default_model(selected_provider)
+                st.session_state.llm_model = current_model
+            else:
+                # Preserve explicit user choice for OpenAI models.
+                model_options = [current_model] + [m for m in model_options if m != current_model]
         elif not current_model:
             current_model = _provider_default_model(selected_provider)
             if current_model not in model_options and model_options:
@@ -2218,7 +3304,7 @@ def main() -> None:
 
         model_index = model_options.index(current_model) if current_model in model_options else 0
         st.selectbox(
-            "Model",
+            "Model" if T is EN else "模型",
             model_options,
             index=model_index,
             key="llm_model",
@@ -2235,7 +3321,7 @@ def main() -> None:
         remember[selected_provider] = str(st.session_state.get("llm_model", current_model))
         st.session_state.llm_last_model_by_provider = remember
         st.slider(
-            "Temperature",
+            "Temperature" if T is EN else "温度",
             min_value=0.0,
             max_value=1.5,
             value=float(st.session_state.get("llm_temperature", OPENAI_TEMPERATURE)),
@@ -2243,7 +3329,7 @@ def main() -> None:
             key="llm_temperature",
         )
         st.number_input(
-            "Timeout (s)",
+            "Timeout (s)" if T is EN else "超时 (秒)",
             min_value=5.0,
             max_value=300.0,
             value=float(st.session_state.get("llm_timeout_s", OPENAI_TIMEOUT_S)),
@@ -2251,22 +3337,26 @@ def main() -> None:
             key="llm_timeout_s",
         )
         st.toggle(
-            "LLM-only Debug Mode (blueprint)",
+            "LLM-only Debug Mode (blueprint)" if T is EN else "LLM-only 调试模式（蓝图）",
             value=bool(st.session_state.get("llm_only_debug_mode", LLM_ONLY_DEBUG_MODE)),
             key="llm_only_debug_mode",
-            help="Enable debug_routing_step output with top-30 loads and top-50 branches.",
+            help=(
+                "Enable debug_routing_step output with top-30 loads and top-50 branches."
+                if T is EN
+                else "启用 debug_routing_step 输出（Top-30 负荷、Top-50 支路）。"
+            ),
         )
         st.text_input(
-            "MATPOWER data root",
+            "MATPOWER data root" if T is EN else "MATPOWER 数据根目录",
             key="matpower_data_root",
             value=str(st.session_state.get("matpower_data_root", MATPOWER_DATA_ROOT)),
-            help="Default: data/matpower",
+            help="Default: data/matpower" if T is EN else "默认：data/matpower",
         )
         st.text_input(
-            "MATPOWER case date",
+            "MATPOWER case date" if T is EN else "MATPOWER 用例日期",
             key="matpower_case_date",
             value=str(st.session_state.get("matpower_case_date", MATPOWER_CASE_DATE)),
-            help="Default: 2017-01-01",
+            help="Default: 2017-01-01" if T is EN else "默认：2017-01-01",
         )
         with st.expander(T["external_import_title"], expanded=False):
             raw_external = st.text_area(
@@ -2337,7 +3427,7 @@ def main() -> None:
                 hide_index=True,
             )
         else:
-            st.caption("(empty)")
+            st.caption("(empty)" if T is EN else "（空）")
 
         undo_disabled = len(st.session_state.net_history) <= 1
         if st.button(T["sidebar_undo"], key="sidebar_undo_last", disabled=undo_disabled, use_container_width=True):
@@ -2356,24 +3446,24 @@ def main() -> None:
             st.warning(_no_api_message(T, provider))
 
         st.divider()
-        st.markdown("### Quick (no-LLM)")
+        st.markdown("### Quick (no-LLM)" if T is EN else "### 快捷操作（无 LLM）")
         cols = st.columns(2)
         with cols[0]:
-            if st.button("Run PF", key="sidebar_quick_run_pf", use_container_width=True, type="primary"):
+            if st.button("Run PF" if T is EN else "运行潮流", key="sidebar_quick_run_pf", use_container_width=True, type="primary"):
                 _run_pf_direct(T)
         with cols[1]:
-            if st.button("Voltage", key="sidebar_quick_voltage", use_container_width=True):
+            if st.button("Voltage" if T is EN else "电压图", key="sidebar_quick_voltage", use_container_width=True):
                 _plot_direct("voltage_heatmap", T)
 
         cols2 = st.columns(2)
         with cols2[0]:
-            if st.button("N-1", key="sidebar_quick_n1", disabled=llm_only_active, use_container_width=True):
+            if st.button("N-1" if T is EN else "N-1 分析", key="sidebar_quick_n1", disabled=llm_only_active, use_container_width=True):
                 _run_n1_direct(T, top_k=int(st.session_state.get("n1_topk", 5) or 5))
         with cols2[1]:
-            if st.button("Remedial", key="sidebar_quick_remedial", disabled=llm_only_active, use_container_width=True):
+            if st.button("Remedial" if T is EN else "缓解建议", key="sidebar_quick_remedial", disabled=llm_only_active, use_container_width=True):
                 _run_remedial_direct(T, max_actions=5)
 
-        if st.button("All Plots", key="sidebar_quick_all_plots", use_container_width=True):
+        if st.button("All Plots" if T is EN else "全部图表", key="sidebar_quick_all_plots", use_container_width=True):
             _plot_all_direct(T)
 
     _render_runtime_status_bar(T)
@@ -2424,17 +3514,56 @@ def main() -> None:
             if m.get("plot_json"):
                 try:
                     if m.get("plot_type") == "flow_diagram" and isinstance(m.get("plot_html"), str):
-                        components.html(m["plot_html"], height=720, scrolling=False)
+                        components.html(
+                            m["plot_html"],
+                            height=720,
+                            scrolling=False,
+                        )
+                    elif m.get("plot_type") in {"voltage_heatmap", "violation_overview"}:
+                        animated = _build_animated_plot_html(m["plot_json"], str(m.get("plot_type")))
+                        if animated is not None:
+                            anim_html, anim_h = animated
+                            components.html(
+                                anim_html,
+                                height=anim_h,
+                                scrolling=False,
+                            )
+                        else:
+                            fig = pio.from_json(m["plot_json"])
+                            st.plotly_chart(
+                                fig,
+                                use_container_width=True,
+                                key=f"chat_plot_{mi}",
+                                config={"displaylogo": False},
+                            )
                     elif m.get("plot_type") == "comparison":
                         fig = pio.from_json(m["plot_json"])
                         panels = _split_comparison_figure(fig, T)
                         for pi, pf in enumerate(panels):
-                            st.plotly_chart(
-                                pf,
-                                use_container_width=True,
-                                key=f"chat_plot_{mi}_cmp_{pi}",
-                                config={"displaylogo": False},
-                            )
+                            if pi == 1:
+                                panel_json = pio.to_json(pf, validate=False)
+                                animated = _build_animated_plot_html(panel_json, "comparison_panel")
+                                if animated is not None:
+                                    anim_html, anim_h = animated
+                                    components.html(
+                                        anim_html,
+                                        height=anim_h,
+                                        scrolling=False,
+                                    )
+                                else:
+                                    st.plotly_chart(
+                                        pf,
+                                        use_container_width=True,
+                                        key=f"chat_plot_{mi}_cmp_{pi}",
+                                        config={"displaylogo": False},
+                                    )
+                            else:
+                                st.plotly_chart(
+                                    pf,
+                                    use_container_width=True,
+                                    key=f"chat_plot_{mi}_cmp_{pi}",
+                                    config={"displaylogo": False},
+                                )
                     else:
                         fig = pio.from_json(m["plot_json"])
                         st.plotly_chart(
@@ -2444,7 +3573,10 @@ def main() -> None:
                             config={"displaylogo": False},
                         )
                 except Exception as e:
-                    st.error(f"Plot render error: {type(e).__name__}: {e}")
+                    if T is EN:
+                        st.error(f"Plot render error: {type(e).__name__}: {e}")
+                    else:
+                        st.error(f"图表渲染失败：{type(e).__name__}: {e}")
 
             # Support rendering multiple figures in one message.
             if m.get("extra_plots"):
@@ -2453,17 +3585,56 @@ def main() -> None:
                         if ep.get("title"):
                             st.markdown(f"**{ep['title']}**")
                         if ep.get("plot_type") == "flow_diagram" and isinstance(ep.get("html"), str):
-                            components.html(ep["html"], height=720, scrolling=False)
+                            components.html(
+                                ep["html"],
+                                height=720,
+                                scrolling=False,
+                            )
+                        elif ep.get("plot_type") in {"voltage_heatmap", "violation_overview"}:
+                            animated = _build_animated_plot_html(ep["figure_json"], str(ep.get("plot_type")))
+                            if animated is not None:
+                                anim_html, anim_h = animated
+                                components.html(
+                                    anim_html,
+                                    height=anim_h,
+                                    scrolling=False,
+                                )
+                            else:
+                                fig2 = pio.from_json(ep["figure_json"])
+                                st.plotly_chart(
+                                    fig2,
+                                    use_container_width=True,
+                                    key=f"chat_extra_plot_{mi}_{epi}",
+                                    config={"displaylogo": False},
+                                )
                         elif ep.get("plot_type") == "comparison":
                             fig2 = pio.from_json(ep["figure_json"])
                             panels2 = _split_comparison_figure(fig2, T)
                             for pi, pf2 in enumerate(panels2):
-                                st.plotly_chart(
-                                    pf2,
-                                    use_container_width=True,
-                                    key=f"chat_extra_plot_{mi}_{epi}_cmp_{pi}",
-                                    config={"displaylogo": False},
-                                )
+                                if pi == 1:
+                                    panel_json2 = pio.to_json(pf2, validate=False)
+                                    animated = _build_animated_plot_html(panel_json2, "comparison_panel")
+                                    if animated is not None:
+                                        anim_html, anim_h = animated
+                                        components.html(
+                                            anim_html,
+                                            height=anim_h,
+                                            scrolling=False,
+                                        )
+                                    else:
+                                        st.plotly_chart(
+                                            pf2,
+                                            use_container_width=True,
+                                            key=f"chat_extra_plot_{mi}_{epi}_cmp_{pi}",
+                                            config={"displaylogo": False},
+                                        )
+                                else:
+                                    st.plotly_chart(
+                                        pf2,
+                                        use_container_width=True,
+                                        key=f"chat_extra_plot_{mi}_{epi}_cmp_{pi}",
+                                        config={"displaylogo": False},
+                                    )
                         elif ep.get("plot_type") == "quantitative_comparison":
                             # White card container for quantitative comparison
                             with st.container():
@@ -2500,6 +3671,15 @@ def main() -> None:
                                 st.markdown("</div>", unsafe_allow_html=True)
 
                             _render_benchmark_cards(ep, mi, epi, T)
+                        elif ep.get("plot_type") == "report":
+                            st.download_button(
+                                "Download Report (.md)" if T is EN else "下载报告 (.md)",
+                                data=ep.get("report_md", ""),
+                                file_name=ep.get("report_filename", "report.md"),
+                                mime="text/markdown",
+                                key=f"chat_report_{mi}_{epi}",
+                                use_container_width=True,
+                            )
                         else:
                             fig2 = pio.from_json(ep["figure_json"])
                             st.plotly_chart(
@@ -2509,16 +3689,19 @@ def main() -> None:
                                 config={"displaylogo": False},
                             )
                     except Exception as e:
-                        st.error(f"Extra plot render error: {type(e).__name__}: {e}")
+                        if T is EN:
+                            st.error(f"Extra plot render error: {type(e).__name__}: {e}")
+                        else:
+                            st.error(f"附加图表渲染失败：{type(e).__name__}: {e}")
 
             if m["role"] == "assistant" and m.get("n1_report"):
-                with st.expander("N-1 Top-K Scenarios", expanded=True):
+                with st.expander("N-1 Top-K Scenarios" if T is EN else "N-1 Top-K 场景", expanded=True):
                     rep = m["n1_report"]
                     st.markdown(rep.get("summary_text") or "")
                     st.dataframe(rep.get("results") or [], use_container_width=True)
 
             if m["role"] == "assistant" and m.get("remedial_plan"):
-                with st.expander("Remedial actions", expanded=True):
+                with st.expander("Remedial actions" if T is EN else "缓解建议", expanded=True):
                     rp = m["remedial_plan"]
                     st.markdown(rp.get("summary_text") or "")
                     st.write({"base_risk": rp.get("base_risk"), "case": rp.get("case_name")})
@@ -2546,7 +3729,11 @@ def main() -> None:
                         )
                         if same_plan and getattr(latest_plan, "actions", None):
                             st.divider()
-                            st.markdown("**One-click apply (modifies network)**")
+                            st.markdown(
+                                "**One-click apply (modifies network)**"
+                                if T is EN
+                                else "**一键应用（会修改网络）**"
+                            )
                             for i, a in enumerate(latest_plan.actions[: len(actions)]):
                                 cols = st.columns([0.84, 0.16])
                                 with cols[0]:
@@ -2558,6 +3745,17 @@ def main() -> None:
                                         disabled=llm_only_active,
                                     ):
                                         _queue_remedial_apply(i, source="chat")
+
+            # Report download button
+            if m["role"] == "assistant" and m.get("report_md"):
+                st.download_button(
+                    "Download Report (.md)" if T is EN else "下载报告 (.md)",
+                    data=m["report_md"],
+                    file_name=m.get("report_filename", "report.md"),
+                    mime="text/markdown",
+                    key=f"dl_report_{mi}",
+                    use_container_width=True,
+                )
 
             if m["role"] == "assistant" and m.get("result"):
                 _render_result_details(m["result"], T)
@@ -2597,11 +3795,11 @@ def main() -> None:
         if st.button(T["btn_remedial"], key="quick_generate_remedial", disabled=llm_only_active, use_container_width=True):
             _run_remedial_direct(T, max_actions=5)
     with btn_cols[6]:
-        if st.button("All Plots", key="quick_all_plots", use_container_width=True):
+        if st.button("All Plots" if T is EN else "全部图表", key="quick_all_plots", use_container_width=True):
             _plot_all_direct(T)
     with btn_cols[7]:
         if st.button(T["btn_report"], key="quick_export_report", use_container_width=True):
-            process_user_input("Export current analysis report." if T is EN else "导出当前分析报告。", T)
+            _export_report_direct(T)
 
     _render_bottom_stats(T)
 
@@ -2610,6 +3808,24 @@ def main() -> None:
     if user_text:
         process_user_input(user_text, T)
 
+    # Footer contact
+    st.markdown(
+        (
+            "<div style='text-align:center; padding:2rem 0 1rem; color:#ccc; font-size:0.7rem;'>"
+            "Questions or feedback? Contact "
+            "<a href='mailto:kaliang@ucsd.edu' style='color:#ccc; text-decoration:none;'>kaliang@ucsd.edu</a>"
+            " · LKK"
+            "</div>"
+            if T is EN
+            else
+            "<div style='text-align:center; padding:2rem 0 1rem; color:#ccc; font-size:0.7rem;'>"
+            "如有问题或建议，请联系 "
+            "<a href='mailto:kaliang@ucsd.edu' style='color:#ccc; text-decoration:none;'>kaliang@ucsd.edu</a>"
+            " · LKK"
+            "</div>"
+        ),
+        unsafe_allow_html=True,
+    )
 
 if __name__ == "__main__":
     main()

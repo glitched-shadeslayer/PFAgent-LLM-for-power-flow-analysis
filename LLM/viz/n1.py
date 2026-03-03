@@ -132,7 +132,7 @@ def make_n1_ranking(
         ),
         paper_bgcolor=p["paper"],
         plot_bgcolor=p["plot"],
-        margin=dict(l=24, r=65, t=98, b=122),
+        margin=dict(l=24, r=65, t=124, b=122),
         bargap=0.4,
         xaxis=dict(
             title=x_title,
@@ -160,8 +160,8 @@ def make_n1_ranking(
         ),
         legend=dict(
             orientation="h",
-            yanchor="top",
-            y=0.985,
+            yanchor="bottom",
+            y=1.08,
             xanchor="right",
             x=0.98,
             valign="middle",

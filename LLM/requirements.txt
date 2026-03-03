@@ -1,5 +1,6 @@
 google-genai
 matpowercaseframes
+networkx
 numpy
 openai
 pandapower

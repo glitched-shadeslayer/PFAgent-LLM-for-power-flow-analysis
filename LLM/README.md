@@ -1,5 +1,7 @@
 # Power Flow Platform — Step 7+ Closed-Loop
 
+For easy using: https://poweragent.streamlit.app/
+
 > LLM-augmented interactive AC power flow analysis platform with closed-loop remedial control.
 
 A Streamlit-based web application that integrates **PandaPower** numerical simulation with **LLM tool-calling** (OpenAI / Gemini) to deliver a complete power system analysis workflow: case loading, power flow solving, N-1 contingency ranking, heuristic remedial actions, and rich Plotly visualizations — all driven through a conversational chat interface.

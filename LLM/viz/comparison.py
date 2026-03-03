@@ -9,8 +9,28 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
 from models.schemas import LineFlow, PowerFlowResult
-from viz.network_plot import Theme, build_graph, bus_display_id, compute_layout
+from viz.network_plot import Theme, build_graph, bus_display_id
 from viz.voltage_heatmap import _voltage_colorscale
+
+
+def _axis_ranges_like_pf(
+    positions: dict[int, tuple[float, float]],
+    *,
+    force_ieee14: bool,
+) -> tuple[list[float], list[float]]:
+    if force_ieee14:
+        return [-1.9, 10.9], [-0.8, 8.8]
+    xs = [float(v[0]) for v in positions.values()]
+    ys = [float(v[1]) for v in positions.values()]
+    if not xs or not ys:
+        return [-1.0, 1.0], [-1.0, 1.0]
+    xmin, xmax = min(xs), max(xs)
+    ymin, ymax = min(ys), max(ys)
+    dx = max(1e-6, xmax - xmin)
+    dy = max(1e-6, ymax - ymin)
+    pad_x = 0.12 * dx
+    pad_y = 0.12 * dy
+    return [xmin - pad_x, xmax + pad_x], [ymin - pad_y, ymax + pad_y]
 
 
 def _bus_vm_map(result: PowerFlowResult) -> dict[int, float]:
@@ -42,10 +62,19 @@ def make_comparison(
     vmax: float = 1.10,
 ) -> go.Figure:
     """Side-by-side comparison with explicit change highlighting."""
+    # Local import avoids module-level cycles (flow_diagram imports network_plot).
+    from viz.flow_diagram import resolve_flow_positions
 
     g = build_graph(net)
-    if positions is None:
-        positions = compute_layout(net, g)
+    positions = resolve_flow_positions(
+        net,
+        after,
+        positions=positions,
+        use_ieee14_fixed_layout=True,
+        graph=g,
+    )
+    force_ieee14 = str(getattr(after, "case_name", "") or "").lower() == "case14"
+    xr, yr = _axis_ranges_like_pf(positions, force_ieee14=force_ieee14)
 
     bus_idxs = list(net.bus.index.tolist())
     bus_ids = [int(bus_display_id(net, int(i))) for i in bus_idxs]
@@ -370,6 +399,10 @@ def make_comparison(
     for r, c in [(1, 1), (2, 1)]:
         fig.update_xaxes(showgrid=False, zeroline=False, visible=False, row=r, col=c)
         fig.update_yaxes(showgrid=False, zeroline=False, visible=False, row=r, col=c)
+    fig.update_xaxes(range=xr, row=1, col=1)
+    fig.update_yaxes(range=yr, scaleanchor="x", row=1, col=1)
+    fig.update_xaxes(range=xr, row=2, col=1)
+    fig.update_yaxes(range=yr, scaleanchor="x2", row=2, col=1)
 
     return fig
 

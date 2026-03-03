@@ -310,7 +310,7 @@ def compute_benchmark_cards(
     *,
     lang: Literal["zh", "en"] = "en",
 ) -> List[Dict[str, Any]]:
-    """Return a list of 14 metric card definitions for rendering."""
+    """Return benchmark metric card definitions for tiered rendering."""
 
     cards: List[Dict[str, Any]] = []
 
@@ -365,9 +365,17 @@ def compute_benchmark_cards(
          metrics.get("power_balance_error"), "MW", ".3f",
          _grade_color(metrics.get("power_balance_error"), (0.1, 1.0)), 3)
 
-    _add("KCL Viol Rate", "KCL违反率",
-         metrics.get("kcl_violation_rate"), "%", ".1f",
-         _grade_color(metrics.get("kcl_violation_rate"), (5.0, 20.0)), 3)
+    _add("KCL Self-Viol", "KCL自洽违反率",
+         metrics.get("kcl_self_violation_rate"), "%", ".1f",
+         _grade_color(metrics.get("kcl_self_violation_rate"), (10.0, 30.0)), 3)
+
+    _add("KCL Max ΔP", "KCL最大偏差",
+         metrics.get("kcl_max_mismatch_mw"), "MW", ".2f",
+         _grade_color(metrics.get("kcl_max_mismatch_mw"), (2.0, 10.0)), 3)
+
+    _add("Flow Deviation", "潮流偏差率",
+         metrics.get("flow_deviation_rate"), "%", ".1f",
+         _grade_color(metrics.get("flow_deviation_rate"), (5.0, 20.0)), 3)
 
     _add("Voltage F1", "电压越限F1",
          metrics.get("voltage_f1"), "", ".3f",
