@@ -165,19 +165,24 @@ class LLMEngine:
 
         tool_round = 0
         while True:
-            if tool_round > self.config.max_tool_rounds:
+            if tool_round >= self.config.max_tool_rounds:
                 final_text = "工具调用轮次超过上限。请缩小问题范围或减少连续操作。"
                 session.conversation_history.append({"role": "assistant", "content": final_text})
                 return final_text
 
-            resp = self.client.create(
-                model=self.config.model,
-                messages=messages,
-                tools=self._openai_tools,
-                tool_choice="auto",
-                temperature=self.config.temperature,
-                timeout=self.config.timeout_s,
-            )
+            try:
+                resp = self.client.create(
+                    model=self.config.model,
+                    messages=messages,
+                    tools=self._openai_tools,
+                    tool_choice="auto",
+                    temperature=self.config.temperature,
+                    timeout=self.config.timeout_s,
+                )
+            except Exception as e:
+                err_text = f"LLM request failed: {type(e).__name__}: {e}"
+                session.conversation_history.append({"role": "assistant", "content": err_text})
+                return err_text
 
             msg = _extract_choice_message(resp)
             assistant_entry: Dict[str, Any] = {

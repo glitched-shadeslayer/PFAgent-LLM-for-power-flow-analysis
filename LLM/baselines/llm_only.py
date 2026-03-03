@@ -428,13 +428,20 @@ def _build_truth_line_maps(
         thermal_map: set[int] = set()
 
         for parsed_lid, (fb, tb) in parsed.line_ends.items():
-            lf = by_edge.get((int(fb), int(tb)))
+            fb_i, tb_i = int(fb), int(tb)
+            lf = by_edge.get((fb_i, tb_i))
+            sign = 1.0
+            if lf is None:
+                # Allow reverse endpoint matching; flip sign into parsed orientation.
+                lf = by_edge.get((tb_i, fb_i))
+                if lf is not None:
+                    sign = -1.0
             if lf is None:
                 continue
-            p_map[int(parsed_lid)] = float(lf.p_from_mw)
+            p_map[int(parsed_lid)] = sign * float(lf.p_from_mw)
             loading_map[int(parsed_lid)] = float(lf.loading_percent)
-            from_map[int(parsed_lid)] = int(lf.from_bus)
-            to_map[int(parsed_lid)] = int(lf.to_bus)
+            from_map[int(parsed_lid)] = fb_i
+            to_map[int(parsed_lid)] = tb_i
             if int(lf.line_id) in truth_thermal_ids:
                 thermal_map.add(int(parsed_lid))
 
@@ -536,16 +543,133 @@ def _confusion_matrix(pred: set[int], truth: set[int], all_ids: set[int]) -> Dic
     return {"tp": tp, "fp": fp, "fn": fn, "tn": tn}
 
 
+def _bus_idx_to_display(net: Any, bus_idx: int) -> int:
+    """Convert pandapower internal bus index to display ID (same logic as viz)."""
+    import re as _re
+    try:
+        name = net.bus.at[bus_idx, "name"]
+        s = str(name).strip() if name is not None else ""
+        if s and _re.fullmatch(r"[-+]?\d+", s):
+            return int(s)
+    except Exception:
+        pass
+    return int(bus_idx) + 1
+
+
+def _compute_kcl_self_consistency(
+    parsed: "BaselineParsed",
+    net: Any,
+    truth: "PowerFlowResult",
+    *,
+    kcl_tol_mw: float = 2.0,
+) -> Dict[str, Any]:
+    """True Kirchhoff's Current Law self-consistency check.
+
+    Since we only have p_from_mw (not p_to_mw), computing net bus outflow from
+    line flows introduces systematic error from line losses.  To cancel this,
+    we compute the SAME metric for both LLM and truth line flows, then report
+    the *excess* mismatch:  ``excess(b) = llm_mismatch(b) - truth_mismatch(b)``.
+
+    A perfect prediction yields excess = 0 everywhere.
+
+    Returns dict with kcl_self_violation_rate (%), kcl_max_mismatch_mw,
+    kcl_mean_mismatch_mw.
+    """
+    # Build known per-bus active power injection (P_gen - P_load) using display IDs.
+    bus_p_known: Dict[int, float] = {}
+
+    if hasattr(net, "load") and net.load is not None:
+        for _, row in net.load.iterrows():
+            if not row.get("in_service", True):
+                continue
+            disp = _bus_idx_to_display(net, int(row["bus"]))
+            bus_p_known[disp] = bus_p_known.get(disp, 0.0) - float(row["p_mw"])
+
+    if hasattr(net, "gen") and net.gen is not None:
+        for _, row in net.gen.iterrows():
+            if not row.get("in_service", True):
+                continue
+            disp = _bus_idx_to_display(net, int(row["bus"]))
+            bus_p_known[disp] = bus_p_known.get(disp, 0.0) + float(row["p_mw"])
+
+    # Slack buses — skip (generation unknown a priori).
+    slack_display_ids: set[int] = set()
+    if hasattr(net, "ext_grid") and net.ext_grid is not None:
+        for _, row in net.ext_grid.iterrows():
+            if not row.get("in_service", True):
+                continue
+            slack_display_ids.add(_bus_idx_to_display(net, int(row["bus"])))
+
+    # Helper: compute net outflow per bus from a set of line flows.
+    def _bus_outflow(line_p: Dict[int, float], line_ends: Dict[int, Tuple[int, int]]) -> Dict[int, float]:
+        out: Dict[int, float] = {}
+        for lid, (fb, tb) in line_ends.items():
+            p = line_p.get(lid, 0.0)
+            out[fb] = out.get(fb, 0.0) + p
+            out[tb] = out.get(tb, 0.0) - p
+        return out
+
+    # LLM bus outflows
+    llm_outflow = _bus_outflow(parsed.line_p, parsed.line_ends)
+
+    # Truth bus outflows (using same endpoint mapping as LLM so line-loss bias cancels)
+    truth_p_by_edge: Dict[Tuple[int, int], float] = {
+        (int(lf.from_bus), int(lf.to_bus)): float(lf.p_from_mw)
+        for lf in truth.line_flows
+    }
+    truth_line_p: Dict[int, float] = {}
+    for lid, (fb, tb) in parsed.line_ends.items():
+        fb_i, tb_i = int(fb), int(tb)
+        tp = truth_p_by_edge.get((fb_i, tb_i))
+        if tp is None:
+            rev = truth_p_by_edge.get((tb_i, fb_i))
+            if rev is not None:
+                tp = -float(rev)
+        if tp is not None:
+            truth_line_p[lid] = tp
+    truth_outflow = _bus_outflow(truth_line_p, parsed.line_ends)
+
+    # Compute excess mismatch per non-slack bus
+    checkable = (set(bus_p_known.keys()) | set(llm_outflow.keys())) - slack_display_ids
+    excess_mismatches: List[float] = []
+    for bus_disp in sorted(checkable):
+        known = bus_p_known.get(bus_disp, 0.0)
+        llm_mm = abs(known - llm_outflow.get(bus_disp, 0.0))
+        truth_mm = abs(known - truth_outflow.get(bus_disp, 0.0))
+        excess = max(0.0, llm_mm - truth_mm)
+        excess_mismatches.append(excess)
+
+    result: Dict[str, Any] = {
+        "kcl_self_violation_rate": None,
+        "kcl_max_mismatch_mw": None,
+        "kcl_mean_mismatch_mw": None,
+    }
+    if excess_mismatches:
+        n_violated = sum(1 for m in excess_mismatches if m > kcl_tol_mw)
+        result["kcl_self_violation_rate"] = float(n_violated / len(excess_mismatches) * 100.0)
+        result["kcl_max_mismatch_mw"] = float(max(excess_mismatches))
+        result["kcl_mean_mismatch_mw"] = float(np.mean(excess_mismatches))
+    return result
+
+
 def evaluate_against_truth_extended(
     parsed: BaselineParsed,
     truth: "PowerFlowResult",
     *,
+    net: Any = None,
     v_min: float = 0.95,
     v_max: float = 1.05,
     max_loading: float = 100.0,
     top_k_weak: int = 5,
 ) -> Dict[str, Any]:
-    """Extended benchmark metrics: 14 scientific indicators + raw data for visualization."""
+    """Extended benchmark metrics: scientific indicators + raw data for visualization.
+
+    Parameters
+    ----------
+    net : pandapower network, optional
+        If provided, enables true KCL self-consistency checks using known
+        per-bus load/generation from the network topology.
+    """
 
     # Start from base metrics
     base = evaluate_against_truth(parsed, truth, v_min=v_min, v_max=v_max, max_loading=max_loading)
@@ -608,10 +732,9 @@ def evaluate_against_truth_extended(
         parsed.total_generation_mw - parsed.total_load_mw - parsed.total_loss_mw
     ))
 
-    # KCL violation rate: for each bus, compare sum of incident line flows (LLM vs truth)
-    kcl_violation_rate = None
+    # Flow deviation rate: per-bus flow accuracy (LLM vs truth), NOT a true KCL check.
+    flow_deviation_rate = None
     if common_lines and common_buses:
-        # Build per-bus net injection from line flows
         bus_flow_llm: Dict[int, float] = {}
         bus_flow_truth: Dict[int, float] = {}
         for lid in common_lines:
@@ -621,20 +744,30 @@ def evaluate_against_truth_extended(
                 continue
             p_l = parsed.line_p[lid]
             p_t = truth_p[lid]
-            # from_bus: flow out is positive
             bus_flow_llm[fb] = bus_flow_llm.get(fb, 0.0) + p_l
             bus_flow_truth[fb] = bus_flow_truth.get(fb, 0.0) + p_t
             bus_flow_llm[tb] = bus_flow_llm.get(tb, 0.0) - p_l
             bus_flow_truth[tb] = bus_flow_truth.get(tb, 0.0) - p_t
 
-        kcl_buses = sorted(bus_flow_llm.keys() & bus_flow_truth.keys())
-        if kcl_buses:
-            kcl_tol = 1.0  # MW tolerance
-            n_violated = sum(
-                1 for b in kcl_buses
-                if abs(bus_flow_llm[b] - bus_flow_truth[b]) > kcl_tol
+        dev_buses = sorted(bus_flow_llm.keys() & bus_flow_truth.keys())
+        if dev_buses:
+            dev_tol = 1.0  # MW tolerance
+            n_deviated = sum(
+                1 for b in dev_buses
+                if abs(bus_flow_llm[b] - bus_flow_truth[b]) > dev_tol
             )
-            kcl_violation_rate = float(n_violated / len(kcl_buses) * 100.0)
+            flow_deviation_rate = float(n_deviated / len(dev_buses) * 100.0)
+
+    # True KCL self-consistency: check if LLM's own line flows satisfy Kirchhoff's
+    # Current Law at each bus, using known loads/generation from the network.
+    kcl_self_violation_rate = None
+    kcl_max_mismatch_mw = None
+    kcl_mean_mismatch_mw = None
+    if net is not None and parsed.line_ends:
+        kcl_metrics = _compute_kcl_self_consistency(parsed, net, truth)
+        kcl_self_violation_rate = kcl_metrics.get("kcl_self_violation_rate")
+        kcl_max_mismatch_mw = kcl_metrics.get("kcl_max_mismatch_mw")
+        kcl_mean_mismatch_mw = kcl_metrics.get("kcl_mean_mismatch_mw")
 
     # F1 scores
     v_prec = base.get("voltage_violation_precision")
@@ -704,7 +837,10 @@ def evaluate_against_truth_extended(
         "loading_rmse": loading_rmse,
         # Tier 3
         "power_balance_error": power_balance_error,
-        "kcl_violation_rate": kcl_violation_rate,
+        "flow_deviation_rate": flow_deviation_rate,
+        "kcl_self_violation_rate": kcl_self_violation_rate,
+        "kcl_max_mismatch_mw": kcl_max_mismatch_mw,
+        "kcl_mean_mismatch_mw": kcl_mean_mismatch_mw,
         "voltage_f1": voltage_f1,
         "thermal_f1": thermal_f1,
         "convergence_match": convergence_match,
