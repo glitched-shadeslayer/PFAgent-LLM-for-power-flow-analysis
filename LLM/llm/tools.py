@@ -34,6 +34,8 @@ from solver.llm_pf import solve_from_matpower_text as _solve_from_matpower_text
 from solver.matpower_text import FETCH_CMD as _FETCH_CMD
 from solver.matpower_text import get_case_m_path as _get_case_m_path
 from solver.matpower_text import read_case_m_text as _read_case_m_text
+from solver.matpower_text import serialize_net_to_matpower_text as _serialize_net_to_matpower_text
+from solver.matpower_meta import get_matpower_meta_from_net as _get_matpower_meta_from_net
 from solver.net_ops import disconnect_line as _disconnect_line_no_solve
 from solver.net_ops import modify_load as _modify_load_no_solve
 from solver.net_ops import reconnect_line as _reconnect_line_no_solve
@@ -307,16 +309,27 @@ def build_default_dispatcher(ctx: ToolContext) -> ToolDispatcher:
         case_name = _resolve_case_name_for_matpower()
         data_root = str(ctx.matpower_data_root or MATPOWER_DATA_ROOT)
         case_date = str(ctx.matpower_case_date or MATPOWER_CASE_DATE)
+        matpower_meta = None
+        m_path_for_meta = f"<serialized:{case_name}>"
 
         try:
-            m_path = _get_case_m_path(case_name, date=case_date, root=data_root)
-            matpower_text = _read_case_m_text(case_name, date=case_date, root=data_root)
-        except Exception as e:
-            msg = str(e)
-            out = {"error": msg}
-            if _FETCH_CMD in msg:
-                out["fetch_command"] = _FETCH_CMD
-            return out
+            if ctx.net is None:
+                raise ValueError("Current net is empty.")
+            matpower_text = _serialize_net_to_matpower_text(ctx.net, case_name=case_name, flat_start=True)
+            matpower_meta = _get_matpower_meta_from_net(ctx.net)
+        except Exception as net_exc:
+            try:
+                m_path = _get_case_m_path(case_name, date=case_date, root=data_root)
+                m_path_for_meta = str(m_path)
+                matpower_text = _read_case_m_text(case_name, date=case_date, root=data_root, flat_start=True)
+            except Exception as file_exc:
+                msg = str(file_exc)
+                out = {"error": msg}
+                if _FETCH_CMD in msg:
+                    out["fetch_command"] = _FETCH_CMD
+                elif _FETCH_CMD in str(net_exc):
+                    out["fetch_command"] = _FETCH_CMD
+                return out
 
         provider = str(ctx.llm_provider or "gemini")
         model = str(ctx.llm_model or GEMINI_MODEL)
@@ -333,7 +346,7 @@ def build_default_dispatcher(ctx: ToolContext) -> ToolDispatcher:
         try:
             parsed = _solve_from_matpower_text(
                 matpower_text=matpower_text,
-                m_file_path=str(m_path),
+                m_file_path=m_path_for_meta,
                 case_name=case_name,
                 debug_mode=debug_mode,
                 llm_provider=provider,
@@ -341,6 +354,7 @@ def build_default_dispatcher(ctx: ToolContext) -> ToolDispatcher:
                 api_key=api_key,
                 temperature=temperature,
                 timeout_s=timeout_s,
+                matpower_meta=matpower_meta,
             )
         except Exception as e:
             return {"error": str(e)}

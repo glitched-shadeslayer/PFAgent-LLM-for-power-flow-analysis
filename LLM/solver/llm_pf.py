@@ -21,8 +21,8 @@ from models.llm_only_schema import (
     PowerFlowResultSchema,
     TotalsSchema,
 )
-from solver.matpower_meta import get_matpower_meta
-from solver.matpower_text import get_case_m_path, read_case_m_text
+from solver.matpower_meta import MatpowerMeta, get_matpower_meta, get_matpower_meta_from_net
+from solver.matpower_text import get_case_m_path, read_case_m_text, serialize_net_to_matpower_text
 
 
 logger = logging.getLogger(__name__)
@@ -477,6 +477,7 @@ def solve_from_matpower_text(
     api_key: str,
     temperature: float,
     timeout_s: float,
+    matpower_meta: Optional[MatpowerMeta] = None,
 ) -> PowerFlowResultSchema:
     MAX_RETRIES_FOR_A2_A3 = 2
     last_raw_response: str = ""
@@ -494,11 +495,14 @@ def solve_from_matpower_text(
         _set_last_raw_response(last_raw_response)
         return _build_failure_result(case_name, "Gemini API key is missing.")
 
-    try:
-        meta = get_matpower_meta(m_file_path)
-    except Exception as e:
-        _set_last_raw_response(last_raw_response)
-        return _build_failure_result(case_name, f"metadata extraction failed: {type(e).__name__}: {e}")
+    if matpower_meta is not None:
+        meta = matpower_meta
+    else:
+        try:
+            meta = get_matpower_meta(m_file_path)
+        except Exception as e:
+            _set_last_raw_response(last_raw_response)
+            return _build_failure_result(case_name, f"metadata extraction failed: {type(e).__name__}: {e}")
     zero_rateA_line_ids = set(meta.zero_rateA_line_ids)
 
     system_instruction, user_text = _build_matpower_prompt(
@@ -608,16 +612,24 @@ def solve_with_llm(
     matpower_data_root: str = MATPOWER_DATA_ROOT,
     matpower_case_date: str = MATPOWER_CASE_DATE,
 ) -> PowerFlowResultSchema:
-    """Compatibility wrapper that reads MATPOWER text then runs blueprint solve."""
+    """Compatibility wrapper that serializes the current net then runs blueprint solve."""
 
     _ = (base_url, v_min, v_max, max_loading)  # intentionally unused
     case_name = str(getattr(net, "_case_name", None) or getattr(net, "name", None) or "case14")
-    m_path = get_case_m_path(case_name, date=matpower_case_date, root=matpower_data_root)
-    matpower_text = read_case_m_text(case_name, date=matpower_case_date, root=matpower_data_root)
+    matpower_meta: Optional[MatpowerMeta] = None
+
+    try:
+        matpower_text = serialize_net_to_matpower_text(net, case_name=case_name, flat_start=True)
+        matpower_meta = get_matpower_meta_from_net(net)
+        m_file_path = f"<serialized:{case_name}>"
+    except Exception:
+        m_path = get_case_m_path(case_name, date=matpower_case_date, root=matpower_data_root)
+        matpower_text = read_case_m_text(case_name, date=matpower_case_date, root=matpower_data_root, flat_start=True)
+        m_file_path = str(m_path)
 
     return solve_from_matpower_text(
         matpower_text=matpower_text,
-        m_file_path=str(m_path),
+        m_file_path=m_file_path,
         case_name=case_name,
         debug_mode=bool(debug_mode),
         llm_provider=llm_provider,
@@ -625,4 +637,5 @@ def solve_with_llm(
         api_key=api_key,
         temperature=temperature,
         timeout_s=timeout_s,
+        matpower_meta=matpower_meta,
     )
