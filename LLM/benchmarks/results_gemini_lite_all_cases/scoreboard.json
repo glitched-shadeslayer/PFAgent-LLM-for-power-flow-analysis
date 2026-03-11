@@ -1,0 +1,34 @@
+[
+  {
+    "model": "gemini:gemini-2.5-flash-lite",
+    "task": "baseline_pf",
+    "success_rate": 0.3,
+    "voltage_mae_mean": 0.056181592747862,
+    "flow_mae_mean": 47.30290360224958,
+    "loading_rmse_mean": 17.37465281943602,
+    "voltage_f1_mean": 0.4358974358974359,
+    "thermal_f1_mean": 0.6666666666666666,
+    "convergence_match_rate": 1.0,
+    "prompt_tokens_mean": 4769.666666666667,
+    "completion_tokens_mean": 3551.0,
+    "total_tokens_mean": 8320.666666666666,
+    "cost_usd_mean": 0.0018973666666666667,
+    "cost_usd_total": 0.0056921
+  },
+  {
+    "model": "gemini:gemini-2.5-flash-lite",
+    "task": "blueprint_pf",
+    "success_rate": 0.6,
+    "voltage_mae_mean": 0.04932883666489984,
+    "flow_mae_mean": 38.461579719757005,
+    "loading_rmse_mean": 15.646456560441313,
+    "voltage_f1_mean": 0.5844155844155844,
+    "thermal_f1_mean": 0.6666666666666666,
+    "convergence_match_rate": 1.0,
+    "prompt_tokens_mean": 4831.666666666667,
+    "completion_tokens_mean": 4461.666666666667,
+    "total_tokens_mean": 9293.333333333334,
+    "cost_usd_mean": 0.0022678333333333335,
+    "cost_usd_total": 0.013607000000000001
+  }
+]
