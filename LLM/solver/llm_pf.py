@@ -123,6 +123,15 @@ def build_matpower_prompt_preview(*, matpower_text: str, case_name: str, debug_m
     return f"[SYSTEM]\n{system_instruction}\n\n[USER]\n{user_text}"
 
 
+def build_matpower_prompt_messages(*, matpower_text: str, case_name: str, debug_mode: bool) -> tuple[str, str]:
+    """Return the raw system and user prompt components for benchmark runners."""
+    return _build_matpower_prompt(
+        matpower_text=matpower_text,
+        case_name=case_name,
+        debug_mode=bool(debug_mode),
+    )
+
+
 def _build_retry_user_text(
     *,
     base_user_text: str,

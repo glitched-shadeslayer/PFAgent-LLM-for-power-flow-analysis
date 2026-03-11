@@ -1,0 +1,3 @@
+model,task,success_rate,voltage_mae_mean,flow_mae_mean,loading_rmse_mean,voltage_f1_mean,thermal_f1_mean,convergence_match_rate,prompt_tokens_mean,completion_tokens_mean,total_tokens_mean,cost_usd_mean,cost_usd_total
+openai:gpt-4o-mini,baseline_pf,1.0,,,,0.25,0.75,0.0,7277.0,61.0,7338.0,0.00112815,0.0090252
+openai:gpt-4o-mini,blueprint_pf,0.75,0.04032056263286631,16.534379348608194,18.071340124678983,0.6796536796536796,0.6666666666666666,1.0,6842.25,3431.875,10274.125,0.0030854624999999995,0.024683699999999996
