@@ -75,7 +75,8 @@ class ModelSpec:
 class TaskSpec:
     name: str
     prompt_builder: Callable[[str], tuple[str, str]]
-    response_parser: Callable[[str], Any]
+    response_parser: Callable[[str, dict[str, Any]], Any]
+    context_builder: Optional[Callable[[str], dict[str, Any]]] = None
 
 
 def _content_to_text(content: Any) -> str:
@@ -220,7 +221,7 @@ def _extract_first_json_object(text: str) -> Optional[dict[str, Any]]:
     return None
 
 
-def _baseline_parser(raw_text: str) -> BaselineParsed:
+def _baseline_parser(raw_text: str, _ctx: dict[str, Any]) -> BaselineParsed:
     from baselines.llm_only import BaselineParsed, parse_llm_baseline_json
 
     obj, err = parse_llm_baseline_json(raw_text)
@@ -232,22 +233,17 @@ def _baseline_parser(raw_text: str) -> BaselineParsed:
     return parsed
 
 
-def _blueprint_parser(raw_text: str) -> BaselineParsed:
+def _blueprint_parser(raw_text: str, ctx: dict[str, Any]) -> BaselineParsed:
     from baselines.llm_only import BaselineParsed
-    from models.llm_only_schema import PowerFlowResultSchema
-    from solver.llm_pf import get_last_raw_response
+    from solver.llm_pf import validate_llm_output
 
-    raw = str(raw_text or "").strip()
-    try:
-        parsed = PowerFlowResultSchema.model_validate_json(raw)
-    except Exception:
-        obj = _extract_first_json_object(raw)
-        if not isinstance(obj, dict):
-            fallback = get_last_raw_response().strip()
-            obj = _extract_first_json_object(fallback)
-        if not isinstance(obj, dict):
-            raise ValueError("blueprint_parse_failed")
-        parsed = PowerFlowResultSchema.model_validate(obj)
+    parsed = validate_llm_output(
+        raw_text=str(raw_text or ""),
+        m_file_path=str(ctx["m_file_path"]),
+        case_name=str(ctx["case_name"]),
+        debug_mode=bool(ctx.get("debug_mode", False)),
+        relax_a2=True,
+    )
 
     return BaselineParsed(
         converged=bool(parsed.converged),
@@ -284,6 +280,16 @@ def _build_blueprint_messages(case_name: str) -> tuple[str, str]:
     )
 
 
+def _build_blueprint_context(case_name: str) -> dict[str, Any]:
+    from solver.matpower_text import get_case_m_path
+
+    return {
+        "case_name": case_name,
+        "m_file_path": str(get_case_m_path(case_name)),
+        "debug_mode": False,
+    }
+
+
 TASKS: dict[str, TaskSpec] = {
     "baseline_pf": TaskSpec(
         name="baseline_pf",
@@ -294,6 +300,7 @@ TASKS: dict[str, TaskSpec] = {
         name="blueprint_pf",
         prompt_builder=_build_blueprint_messages,
         response_parser=_blueprint_parser,
+        context_builder=_build_blueprint_context,
     ),
 }
 
@@ -447,6 +454,7 @@ def run_benchmark(
                 if not truth.converged:
                     raise RuntimeError(f"Ground-truth solver did not converge for {case_name}")
                 system_prompt, user_prompt = task.prompt_builder(case_name)
+                parser_ctx = task.context_builder(case_name) if task.context_builder else {}
 
                 for run_idx in range(runs):
                     print(f"{task_name} {case_name} run ID: {run_idx}")
@@ -462,7 +470,7 @@ def run_benchmark(
                             temperature=temperature,
                             timeout_s=timeout_s,
                         )
-                        parsed = task.response_parser(raw_text)
+                        parsed = task.response_parser(raw_text, parser_ctx)
                         metrics = evaluate_against_truth_extended(
                             parsed,
                             truth,

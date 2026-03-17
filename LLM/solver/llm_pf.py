@@ -132,6 +132,49 @@ def build_matpower_prompt_messages(*, matpower_text: str, case_name: str, debug_
     )
 
 
+def validate_llm_output(
+    *,
+    raw_text: str,
+    m_file_path: str,
+    case_name: str,
+    debug_mode: bool,
+    relax_a2: bool = False,
+) -> PowerFlowResultSchema:
+    """Validate a raw LLM output string using the same checks as blueprint mode.
+
+    This performs schema validation plus physical assertions, without making any LLM calls.
+    """
+    meta = get_matpower_meta(m_file_path)
+    zero_rateA_line_ids = set(meta.zero_rateA_line_ids)
+
+    try:
+        parsed = PowerFlowResultSchema.model_validate_json(raw_text)
+    except Exception as e1:
+        obj = _extract_first_json_object(raw_text)
+        if isinstance(obj, dict):
+            try:
+                coerced = _coerce_legacy_payload(obj)
+                parsed = PowerFlowResultSchema.model_validate(coerced)
+            except Exception:
+                raise ValueError(f"schema validation failed: {type(e1).__name__}: {e1}") from e1
+        else:
+            raise ValueError(f"schema validation failed: {type(e1).__name__}: {e1}") from e1
+
+    _autocorrect_zero_ratea_loading(
+        parsed,
+        zero_rateA_line_ids=zero_rateA_line_ids,
+    )
+    _assertions_or_raise(
+        parsed,
+        meta_total_load_mw_ref=meta.total_load_mw_ref,
+        zero_rateA_line_ids=zero_rateA_line_ids,
+        slack_bus_id_ref=meta.slack_bus_id_ref,
+        debug_mode=bool(debug_mode),
+        relax_a2=bool(relax_a2),
+    )
+    return parsed
+
+
 def _build_retry_user_text(
     *,
     base_user_text: str,
@@ -330,6 +373,7 @@ def _assertions_or_raise(
     zero_rateA_line_ids: set[int],
     slack_bus_id_ref: int,
     debug_mode: bool,
+    relax_a2: bool = False,
 ) -> None:
     bus_by_id = {int(b.bus_id): b for b in result.bus_voltages}
     slack = bus_by_id.get(int(slack_bus_id_ref))
@@ -338,16 +382,17 @@ def _assertions_or_raise(
     if not math.isclose(float(slack.va_deg), 0.0, rel_tol=0.0, abs_tol=1e-9):
         raise AssertionError(f"A1 failed: slack bus {slack_bus_id_ref} va_deg must be 0.0.")
 
-    if not math.isclose(
-        float(result.totals.total_load_mw),
-        float(meta_total_load_mw_ref),
-        rel_tol=0.0,
-        abs_tol=0.05,
-    ):
-        raise AssertionError(
-            f"A2 failed: totals.total_load_mw={result.totals.total_load_mw} "
-            f"!= ref={meta_total_load_mw_ref} within abs_tol=0.05."
-        )
+    if not relax_a2:
+        if not math.isclose(
+            float(result.totals.total_load_mw),
+            float(meta_total_load_mw_ref),
+            rel_tol=0.0,
+            abs_tol=0.05,
+        ):
+            raise AssertionError(
+                f"A2 failed: totals.total_load_mw={result.totals.total_load_mw} "
+                f"!= ref={meta_total_load_mw_ref} within abs_tol=0.05."
+            )
 
     if not math.isclose(
         float(result.totals.total_generation_mw),
@@ -580,6 +625,7 @@ def solve_from_matpower_text(
                 zero_rateA_line_ids=zero_rateA_line_ids,
                 slack_bus_id_ref=meta.slack_bus_id_ref,
                 debug_mode=bool(debug_mode),
+                relax_a2=False,
             )
             _set_last_raw_response(last_raw_response)
             return parsed
