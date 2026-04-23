@@ -22,7 +22,11 @@ from models.llm_only_schema import (
     TotalsSchema,
 )
 from solver.matpower_meta import get_matpower_meta
-from solver.matpower_text import get_case_m_path, read_case_m_text
+from solver.matpower_text import (
+    get_case_m_path,
+    read_case_m_text,
+    scrub_matpower_bus_initial_conditions,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -71,6 +75,7 @@ def _safe_int(v: Any, default: int = 0) -> int:
 
 
 def _build_matpower_prompt(*, matpower_text: str, case_name: str, debug_mode: bool) -> tuple[str, str]:
+    flat_start_text = scrub_matpower_bus_initial_conditions(matpower_text)
     debug_note = (
         "debug_mode=true: include debug_routing_step with at most top 30 loads and top 50 branches."
         if debug_mode
@@ -107,8 +112,10 @@ def _build_matpower_prompt(*, matpower_text: str, case_name: str, debug_mode: bo
     user_text = (
         "CRITICAL: Do not mirror or echo the MATPOWER text. Proceed directly to power flow estimation "
         "and output the resulting JSON.\n"
+        "Flat-start protocol has been applied to mpc.bus: Vm=1.0 p.u. and Va=0 degrees for every bus. "
+        "These are initialization fields only, not solved results.\n"
         f"Analyze this MATPOWER case (case={case_name}, debug_mode={str(debug_mode).lower()}).\n\n"
-        f"{matpower_text}"
+        f"{flat_start_text}"
     )
     return system_instruction, user_text
 

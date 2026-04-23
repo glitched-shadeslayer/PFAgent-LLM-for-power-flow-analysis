@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 
 SUPPORTED_CASES = {"case14", "case30", "case57", "case118", "case300"}
 FETCH_CMD = "python scripts/fetch_matpower_cases.py --ref master --date 2017-01-01"
+_NUMBER_RE = re.compile(
+    r"(?<![\w.])[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?(?![\w.])"
+)
 
 
 def _normalize_case_key(case_key: str) -> str:
@@ -59,3 +63,63 @@ def read_case_m_text(
         out_lines.append(line)
     return "\n".join(out_lines) + "\n"
 
+
+def _replace_number_by_index(text: str, replacements: dict[int, str]) -> str:
+    matches = list(_NUMBER_RE.finditer(text))
+    if len(matches) < max(replacements.keys(), default=-1) + 1:
+        return text
+
+    out: list[str] = []
+    pos = 0
+    for idx, match in enumerate(matches):
+        out.append(text[pos : match.start()])
+        out.append(replacements.get(idx, match.group(0)))
+        pos = match.end()
+    out.append(text[pos:])
+    return "".join(out)
+
+
+def _scrub_bus_row_flat_start(line: str) -> str:
+    body = line.rstrip("\r\n")
+    newline = line[len(body) :]
+
+    comment_start = body.find("%")
+    if comment_start >= 0:
+        code = body[:comment_start]
+        comment = body[comment_start:]
+    else:
+        code = body
+        comment = ""
+
+    # MATPOWER bus columns are 1-based: 8 = Vm, 9 = Va.
+    scrubbed = _replace_number_by_index(code, {7: "1.0", 8: "0"})
+    return f"{scrubbed}{comment}{newline}"
+
+
+def scrub_matpower_bus_initial_conditions(matpower_text: str) -> str:
+    """Apply flat-start protocol to MATPOWER bus Vm/Va initialization fields.
+
+    Only rows inside ``mpc.bus = [ ... ];`` are changed. Column 8 (Vm) becomes
+    1.0 p.u. and column 9 (Va) becomes 0 degrees for every bus row.
+    """
+
+    lines = str(matpower_text or "").splitlines(keepends=True)
+    out: list[str] = []
+    in_bus_matrix = False
+
+    for line in lines:
+        stripped = line.strip()
+        if not in_bus_matrix:
+            out.append(line)
+            if re.match(r"^mpc\.bus\s*=\s*\[", stripped):
+                in_bus_matrix = True
+            continue
+
+        if stripped.startswith("];"):
+            in_bus_matrix = False
+            out.append(line)
+            continue
+
+        out.append(_scrub_bus_row_flat_start(line))
+
+    return "".join(out)

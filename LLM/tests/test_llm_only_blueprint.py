@@ -10,9 +10,13 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from llm.tools import ToolContext, build_default_dispatcher
 from models.schemas import SessionState
-from solver.llm_pf import PROVIDER_ERROR, solve_from_matpower_text
+from solver.llm_pf import (
+    PROVIDER_ERROR,
+    build_matpower_prompt_messages,
+    solve_from_matpower_text,
+)
 from solver.matpower_meta import MatpowerMeta
-from solver.matpower_text import FETCH_CMD, get_case_m_path
+from solver.matpower_text import FETCH_CMD, get_case_m_path, scrub_matpower_bus_initial_conditions
 
 
 def _valid_payload(*, debug_mode: bool, debug_pd_delta: float = 0.0) -> dict:
@@ -51,6 +55,66 @@ def _valid_payload(*, debug_mode: bool, debug_pd_delta: float = 0.0) -> dict:
             "branch_pd_sums": [{"line_id": 1, "from_bus": 1, "to_bus": 2, "pd_sum_mw": 10.0 + debug_pd_delta}],
         }
     return base
+
+
+def _bus_matrix_rows(matpower_text: str) -> list[list[str]]:
+    rows: list[list[str]] = []
+    in_bus = False
+    for raw_line in matpower_text.splitlines():
+        stripped = raw_line.strip()
+        if stripped.startswith("mpc.bus"):
+            in_bus = True
+            continue
+        if in_bus and stripped.startswith("];"):
+            break
+        if not in_bus or not stripped or stripped.startswith("%"):
+            continue
+        rows.append(stripped.rstrip(";").split())
+    return rows
+
+
+def test_matpower_flat_start_scrubber_only_changes_bus_vm_va():
+    raw = (
+        "function mpc = case2;\n"
+        "mpc.bus = [\n"
+        "\t1\t3\t0\t0\t0\t0\t1\t1.06\t2.5\t0\t1\t1.06\t0.94;\n"
+        "\t2\t1\t21.7\t12.7\t0\t0\t1\t0.975\t-4.98\t0\t1\t1.05\t0.95;\n"
+        "];\n"
+        "mpc.gen = [\n"
+        "\t1\t40\t0\t50\t-40\t1.045\t100\t1\t140\t0;\n"
+        "];\n"
+    )
+
+    scrubbed = scrub_matpower_bus_initial_conditions(raw)
+    rows = _bus_matrix_rows(scrubbed)
+
+    assert [row[7] for row in rows] == ["1.0", "1.0"]
+    assert [row[8] for row in rows] == ["0", "0"]
+    assert rows[0][11] == "1.06"
+    assert rows[1][11] == "1.05"
+    assert "1.045" in scrubbed
+
+
+def test_matpower_prompt_uses_flat_start_scrubbed_text():
+    raw = (
+        "function mpc = case2;\n"
+        "mpc.bus = [\n"
+        "\t1\t3\t0\t0\t0\t0\t1\t1.06\t2.5\t0\t1\t1.06\t0.94;\n"
+        "\t2\t1\t21.7\t12.7\t0\t0\t1\t0.975\t-4.98\t0\t1\t1.05\t0.95;\n"
+        "];\n"
+    )
+
+    _, user_text = build_matpower_prompt_messages(
+        matpower_text=raw,
+        case_name="case2",
+        debug_mode=False,
+    )
+    rows = _bus_matrix_rows(user_text)
+
+    assert [row[7] for row in rows] == ["1.0", "1.0"]
+    assert [row[8] for row in rows] == ["0", "0"]
+    assert "0.975" not in user_text
+    assert "-4.98" not in user_text
 
 
 def test_llm_only_blueprint_schema_and_assertions_pass(monkeypatch):
